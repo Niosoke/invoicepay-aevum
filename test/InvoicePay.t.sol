@@ -15,6 +15,7 @@ contract InvoicePayTest is Test {
 
     uint256 internal constant AMOUNT = 25_000000; // 25 tUSD8 (6 decimals)
     uint256 internal dueDate;
+    uint256 internal poCounter;
 
     function setUp() public {
         token = new MockUSD8();
@@ -23,13 +24,33 @@ contract InvoicePayTest is Test {
         token.mint(payer, 1_000_000000); // 1,000 tUSD8
     }
 
+    /// @dev Unique purchase order reference per call, so the existing
+    ///      cycle tests keep working under the duplicate guard.
+    function _nextPo() internal returns (bytes32) {
+        poCounter++;
+        return keccak256(abi.encodePacked("PO ", poCounter));
+    }
+
     function _create() internal returns (uint256 id) {
         vm.prank(merchant);
-        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice 1042, design work");
+        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice 1042, design work", _nextPo());
+    }
+
+    function _createWithPo(bytes32 poRef) internal returns (uint256 id) {
+        vm.prank(merchant);
+        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef);
+    }
+
+    function _pay(uint256 id) internal {
+        vm.startPrank(payer);
+        token.approve(address(pay), AMOUNT);
+        pay.payInvoice(id);
+        vm.stopPrank();
     }
 
     function testCreateInvoice() public {
-        uint256 id = _create();
+        bytes32 poRef = keccak256("PO 1042");
+        uint256 id = _createWithPo(poRef);
         assertEq(id, 0);
         assertEq(pay.invoiceCount(), 1);
 
@@ -39,7 +60,8 @@ contract InvoicePayTest is Test {
         assertEq(inv.amount, AMOUNT);
         assertEq(inv.dueDate, dueDate);
         assertEq(inv.paidAt, 0);
-        assertEq(inv.memo, "Invoice 1042, design work");
+        assertEq(inv.memo, "Invoice for purchase order");
+        assertEq(inv.poRef, poRef);
         assertTrue(inv.status == InvoicePay.Status.Open);
         assertFalse(pay.isOverdue(id));
     }
@@ -47,19 +69,19 @@ contract InvoicePayTest is Test {
     function testCreateRejectsZeroPayer() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.ZeroAddress.selector);
-        pay.createInvoice(address(0), AMOUNT, dueDate, "x");
+        pay.createInvoice(address(0), AMOUNT, dueDate, "x", _nextPo());
     }
 
     function testCreateRejectsZeroAmount() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.ZeroAmount.selector);
-        pay.createInvoice(payer, 0, dueDate, "x");
+        pay.createInvoice(payer, 0, dueDate, "x", _nextPo());
     }
 
     function testCreateRejectsPastDueDate() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.DueDateInPast.selector);
-        pay.createInvoice(payer, AMOUNT, block.timestamp, "x");
+        pay.createInvoice(payer, AMOUNT, block.timestamp, "x", _nextPo());
     }
 
     function testPayInvoiceFullCycle() public {
@@ -173,5 +195,104 @@ contract InvoicePayTest is Test {
 
         assertTrue(pay.getInvoice(a).status == InvoicePay.Status.Open);
         assertTrue(pay.getInvoice(b).status == InvoicePay.Status.Paid);
+    }
+
+    // ------------------------------------------------------------------
+    // Purchase order binding
+    // ------------------------------------------------------------------
+
+    function testCreateRejectsZeroPurchaseOrder() public {
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.ZeroPurchaseOrder.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "x", bytes32(0));
+    }
+
+    function testDuplicatePurchaseOrderReverts() public {
+        bytes32 poRef = keccak256("PO 1042");
+        _createWithPo(poRef);
+
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.DuplicatePurchaseOrder.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "second invoice, same PO", poRef);
+
+        assertEq(pay.invoiceCount(), 1);
+    }
+
+    function testDifferentPurchaseOrdersSameAmount() public {
+        bytes32 poA = keccak256("PO 1042");
+        bytes32 poB = keccak256("PO 1043");
+        uint256 a = _createWithPo(poA);
+        uint256 b = _createWithPo(poB);
+        assertEq(a, 0);
+        assertEq(b, 1);
+
+        // Both invoices carry the same amount and both can be settled.
+        _pay(a);
+        _pay(b);
+        assertTrue(pay.getInvoice(a).status == InvoicePay.Status.Paid);
+        assertTrue(pay.getInvoice(b).status == InvoicePay.Status.Paid);
+        assertEq(token.balanceOf(merchant), AMOUNT * 2);
+    }
+
+    function testCancelFreesPurchaseOrder() public {
+        bytes32 poRef = keccak256("PO 1042");
+        uint256 first = _createWithPo(poRef);
+
+        vm.prank(merchant);
+        pay.cancelInvoice(first);
+
+        // The reference is free again: a fresh invoice can take it.
+        uint256 second = _createWithPo(poRef);
+        assertEq(second, 1);
+        _pay(second);
+        assertTrue(pay.getInvoice(second).status == InvoicePay.Status.Paid);
+        assertEq(token.balanceOf(merchant), AMOUNT);
+    }
+
+    function testPaidPurchaseOrderStaysLocked() public {
+        bytes32 poRef = keccak256("PO 1042");
+        uint256 id = _createWithPo(poRef);
+        _pay(id);
+
+        // A settled purchase order can never be invoiced again.
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.DuplicatePurchaseOrder.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "again", poRef);
+    }
+
+    function testSamePurchaseOrderDifferentMerchant() public {
+        bytes32 poRef = keccak256("PO 1042");
+        address otherMerchant = makeAddr("otherMerchant");
+        _createWithPo(poRef);
+
+        // The binding is per merchant, so another merchant can use the
+        // same reference for their own invoice.
+        vm.prank(otherMerchant);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "other merchant", poRef);
+        assertEq(id, 1);
+        assertEq(pay.getInvoice(id).merchant, otherMerchant);
+    }
+
+    function testPurchaseOrderStatusView() public {
+        bytes32 poRef = keccak256("PO 1042");
+
+        (bool activeBefore, uint256 idBefore) = pay.purchaseOrderStatus(merchant, poRef);
+        assertFalse(activeBefore);
+        assertEq(idBefore, 0);
+
+        uint256 id = _createWithPo(poRef);
+        (bool active, uint256 boundId) = pay.purchaseOrderStatus(merchant, poRef);
+        assertTrue(active);
+        assertEq(boundId, id);
+
+        // A different merchant sees nothing for the same reference.
+        (bool activeOther,) = pay.purchaseOrderStatus(stranger, poRef);
+        assertFalse(activeOther);
+
+        // After cancel the reference reads free again.
+        vm.prank(merchant);
+        pay.cancelInvoice(id);
+        (bool activeAfter,) = pay.purchaseOrderStatus(merchant, poRef);
+        assertFalse(activeAfter);
     }
 }

@@ -39,19 +39,22 @@
   pre { background: #171410; color: #f3ead9; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 12.5px; min-height: 60px; white-space: pre-wrap; }
   .steps { counter-reset: step; }
   .steps li { margin-bottom: 4px; }
+  .guide-step { border-top: 1px dashed #e5ded2; padding-top: 10px; margin-top: 14px; }
+  .guide-step:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
 </style>
 </head>
 <body>
 <main>
   <h1>InvoicePay</h1>
-  <p class="sub">Stablecoin invoices on the QDay Aevum testnet (chain 44005). A merchant creates an invoice in tUSD8, the named payer settles the exact amount on chain, and the contract marks it paid. The contract never holds funds: payment goes straight from payer to merchant.</p>
+  <p class="sub">Stablecoin invoices on the QDay Aevum testnet (chain 44005). A merchant creates an invoice in tUSD8 bound to a purchase order, the named payer settles the exact amount on chain, and the contract marks it paid. One purchase order can only be settled once: a second invoice for the same purchase order is rejected. The contract never holds funds: payment goes straight from payer to merchant.</p>
 
   <section>
     <h2>How this demo works</h2>
     <ol class="steps">
       <li>Connect a wallet. The demo adds the QDay Aevum testnet for you.</li>
-      <li>As the merchant, create an invoice naming the payer and the amount.</li>
-      <li>As the payer (switch account in your wallet), approve tUSD8 and pay.</li>
+      <li>As the merchant, create an invoice naming the payer, the amount, and the purchase order it settles.</li>
+      <li>Try the guided check below: create a second invoice for the same purchase order and watch the contract reject it.</li>
+      <li>As the payer (switch account in your wallet), approve tUSD8 and pay the original invoice.</li>
       <li>Watch the invoice list below flip from Open to Paid, with explorer links for every transaction.</li>
     </ol>
     <p class="hint">You need testnet tQDAY for gas and tUSD8 to pay with. Both come free from the faucet at <a href="https://faucet.qday.info" target="_blank" rel="noopener">faucet.qday.info</a>. This is a testnet: nothing here has real value.</p>
@@ -63,7 +66,7 @@
     <div class="row">
       <div>
         <label>InvoicePay contract</label>
-        <input id="contract" value="0xf1295031c9454bd067D3763052a0410C536792f6" />
+        <input id="contract" value="0x72334b6555eaf05dc78f7a1519f25699700c38ee" />
       </div>
       <div>
         <label>tUSD8 token</label>
@@ -76,17 +79,45 @@
 
   <section>
     <h2>2. Merchant: create an invoice</h2>
-    <p class="hint">You are the merchant. Name the one wallet that is allowed to pay this invoice, set the amount in tUSD8, pick a due date, and add a memo your payer will recognise.</p>
+    <p class="hint">You are the merchant. Name the one wallet that is allowed to pay this invoice, set the amount in tUSD8, pick a due date, add a memo your payer will recognise, and give the purchase order this invoice settles. The purchase order text is hashed before it goes on chain. Only one live invoice per purchase order is allowed: a second invoice for the same purchase order is rejected until the first is cancelled.</p>
     <div class="row">
       <div><label>Payer address</label><input id="payer" placeholder="0x..." /></div>
       <div><label>Amount (tUSD8)</label><input id="amount" type="number" step="0.000001" min="0" value="1" /></div>
     </div>
     <div class="row">
+      <div><label>Purchase order reference</label><input id="poRef" value="PO 1042" /></div>
       <div><label>Due in (days)</label><input id="days" type="number" min="1" value="7" /></div>
+    </div>
+    <div class="row">
       <div><label>Memo</label><input id="memo" value="Invoice 1, demo payment" /></div>
     </div>
+    <p class="small" id="poHashNote"></p>
     <button id="create" disabled>Create invoice</button>
     <p class="status" id="createStatus"></p>
+  </section>
+
+  <section>
+    <h2>Guided check: one purchase order, settled once</h2>
+    <p class="hint">This walks through the core promise of InvoicePay in three steps. It uses the payer address and amount from step 2 above, and its own purchase order reference below. Use a fresh purchase order text (for example PO 2001) so it does not collide with an invoice you already created.</p>
+    <div class="row">
+      <div><label>Purchase order reference for the check</label><input id="guidePo" value="PO 2001" /></div>
+      <div><label>Amount (tUSD8)</label><input id="guideAmount" type="number" step="0.000001" min="0" value="1" /></div>
+    </div>
+    <div class="guide-step">
+      <p class="hint"><strong>Step A.</strong> As the merchant, create the invoice for this purchase order.</p>
+      <button id="guideCreate" disabled>Create the invoice</button>
+      <p class="status" id="guideCreateStatus"></p>
+    </div>
+    <div class="guide-step">
+      <p class="hint"><strong>Step B.</strong> Still as the merchant, try to create a second invoice for the same purchase order. The contract must reject it. A rejection here is the demo working as intended.</p>
+      <button id="guideDuplicate" disabled>Try the duplicate (must be rejected)</button>
+      <p class="status" id="guideDuplicateStatus"></p>
+    </div>
+    <div class="guide-step">
+      <p class="hint"><strong>Step C.</strong> Switch to the payer account in your wallet, then pay the original invoice. It settles exactly once, and the purchase order stays locked afterwards.</p>
+      <button id="guidePay" disabled>Pay the original invoice</button>
+      <p class="status" id="guidePayStatus"></p>
+    </div>
   </section>
 
   <section>
@@ -102,7 +133,7 @@
 
   <section>
     <h2>4. Invoices on chain</h2>
-    <p class="hint">Read live from the contract. Refresh after creating or paying an invoice.</p>
+    <p class="hint">Read live from the contract. Refresh after creating or paying an invoice. The PO column shows the short form of the purchase order hash bound to each invoice.</p>
     <button id="refresh" disabled class="secondary">Refresh invoice list</button>
     <p class="status" id="listStatus"></p>
     <div id="listWrap"></div>
@@ -125,13 +156,14 @@ const AEVUM = {
 };
 const EXPLORER = "https://explorer-test.qday.info";
 const PAY_ABI = [
-  "function createInvoice(address payer, uint256 amount, uint256 dueDate, string memo) returns (uint256)",
+  "function createInvoice(address payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef) returns (uint256)",
   "function payInvoice(uint256 invoiceId)",
   "function cancelInvoice(uint256 invoiceId)",
-  "function getInvoice(uint256 invoiceId) view returns (tuple(address merchant, address payer, uint256 amount, uint256 dueDate, uint256 paidAt, string memo, uint8 status))",
+  "function getInvoice(uint256 invoiceId) view returns (tuple(address merchant, address payer, uint256 amount, uint256 dueDate, uint256 paidAt, string memo, bytes32 poRef, uint8 status))",
   "function isOverdue(uint256 invoiceId) view returns (bool)",
   "function invoiceCount() view returns (uint256)",
-  "event InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount, uint256 dueDate, string memo)",
+  "function purchaseOrderStatus(address merchant, bytes32 poRef) view returns (bool active, uint256 invoiceId)",
+  "event InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef)",
   "event InvoicePaid(uint256 indexed invoiceId, address indexed payer, address indexed merchant, uint256 amount, uint256 paidAt)",
   "event InvoiceCancelled(uint256 indexed invoiceId, address indexed merchant)",
   "error ZeroAddress()",
@@ -143,6 +175,8 @@ const PAY_ABI = [
   "error InvoiceNotOpen()",
   "error TransferFailed()",
   "error ReentrantCall()",
+  "error ZeroPurchaseOrder()",
+  "error DuplicatePurchaseOrder()",
 ];
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
@@ -169,15 +203,28 @@ function txLink(hash) {
   return '<a href="' + EXPLORER + "/tx/" + hash + '" target="_blank" rel="noopener">' + hash.slice(0, 10) + "..." + hash.slice(-6) + "</a>";
 }
 function shortAddr(a) { return a.slice(0, 6) + "..." + a.slice(-4); }
+function shortHash(h) { return h.slice(0, 10) + "..." + h.slice(-4); }
 function fmtDate(ts) {
   return new Date(Number(ts) * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
+// The purchase order text never goes on chain as plain text; only its hash does.
+function poHash(text) { return ethers.id(text); }
+function updatePoNote() {
+  const text = $("poRef").value.trim();
+  $("poHashNote").textContent = text
+    ? "On chain this purchase order is stored as the hash " + poHash(text) + "."
+    : "Enter a purchase order reference. It is hashed before it goes on chain.";
+}
+$("poRef").addEventListener("input", updatePoNote);
+updatePoNote();
 
 // Turn wallet and contract errors into plain language.
 function friendlyError(e) {
   const raw = (e && (e.shortMessage || e.message)) || String(e);
   const lower = raw.toLowerCase();
   if (e && e.code === "ACTION_REJECTED") return "You rejected the request in your wallet. Nothing was sent.";
+  if (lower.includes("duplicatepurchaseorder")) return "Rejected: this purchase order already has an invoice from you. One purchase order can only be settled once. Cancel the first invoice if you need to start over.";
+  if (lower.includes("zeropurchaseorder")) return "Enter a purchase order reference. Every invoice must name the purchase order it settles.";
   if (lower.includes("notpayer")) return "This wallet is not the payer named on the invoice. Switch to the payer account and try again.";
   if (lower.includes("notmerchant")) return "Only the merchant who created this invoice can cancel it.";
   if (lower.includes("invoicenotopen")) return "This invoice is not open any more. It was already paid or cancelled.";
@@ -194,6 +241,7 @@ function friendlyError(e) {
 }
 
 let signer, pay, token, myAddr;
+let guideInvoiceId = null;
 
 async function refreshBalances() {
   if (!signer) return;
@@ -213,14 +261,14 @@ async function refreshList() {
       setStatus("listStatus", "The contract holds 0 invoices.", "");
       return;
     }
-    let html = "<table><thead><tr><th>Id</th><th>Memo</th><th>Amount</th><th>Merchant</th><th>Payer</th><th>Due</th><th>Status</th></tr></thead><tbody>";
+    let html = "<table><thead><tr><th>Id</th><th>Memo</th><th>PO</th><th>Amount</th><th>Merchant</th><th>Payer</th><th>Due</th><th>Status</th></tr></thead><tbody>";
     for (let i = 0; i < count; i++) {
       const inv = await pay.getInvoice(i);
       const status = STATUS[Number(inv.status)];
       let badge = '<span class="badge ' + status.toLowerCase() + '">' + status + "</span>";
       if (status === "Open" && (await pay.isOverdue(i))) badge += ' <span class="badge overdue">Overdue</span>';
       const paidNote = Number(inv.paidAt) > 0 ? '<div class="small">paid ' + fmtDate(inv.paidAt) + "</div>" : "";
-      html += "<tr><td>" + i + "</td><td>" + escapeHtml(inv.memo) + "</td><td>" +
+      html += "<tr><td>" + i + "</td><td>" + escapeHtml(inv.memo) + "</td><td class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</td><td>" +
         ethers.formatUnits(inv.amount, 6) + " tUSD8</td><td class=\"mono\">" + shortAddr(inv.merchant) +
         "</td><td class=\"mono\">" + shortAddr(inv.payer) + "</td><td>" + fmtDate(inv.dueDate) +
         "</td><td>" + badge + paidNote + "</td></tr>";
@@ -234,6 +282,66 @@ async function refreshList() {
 }
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function readCreateInputs() {
+  const payer = $("payer").value.trim();
+  if (!ethers.isAddress(payer)) throw new Error("Enter the payer wallet address in step 2 (it starts with 0x).");
+  if (payer.toLowerCase() === myAddr.toLowerCase()) throw new Error("The payer should be a different wallet than the merchant. Switch accounts for the payment step.");
+  return payer;
+}
+
+async function createInvoiceFlow(payer, amountText, poText, memo, statusId) {
+  const amount = ethers.parseUnits(amountText, 6);
+  if (amount === 0n) throw new Error("The amount must be more than zero.");
+  if (!poText) throw new Error("Enter a purchase order reference. Every invoice must name the purchase order it settles.");
+  const days = Number($("days").value);
+  if (!days || days < 1) throw new Error("Due in days must be at least 1.");
+  const due = Math.floor(Date.now() / 1000) + days * 86400;
+  setStatus(statusId, "Waiting for your wallet confirmation...", "wait");
+  const tx = await pay.createInvoice(payer, amount, due, memo, poHash(poText));
+  setStatus(statusId, "Invoice transaction sent, waiting for confirmation: " + txLink(tx.hash), "wait");
+  log("createInvoice sent: " + tx.hash);
+  const receipt = await tx.wait();
+  const ev = receipt.logs.map((l) => { try { return pay.interface.parseLog(l); } catch { return null; } })
+    .find((p) => p && p.name === "InvoiceCreated");
+  if (ev) {
+    $("invoiceId").value = ev.args.invoiceId.toString();
+    setStatus(statusId, "Invoice " + ev.args.invoiceId + " created for " + amountText + " tUSD8 against purchase order \"" + escapeHtml(poText) + "\". Tx: " + txLink(tx.hash), "ok");
+    log("Invoice created, id " + ev.args.invoiceId + ", purchase order hash " + poHash(poText) + ".");
+    return ev.args.invoiceId;
+  }
+  setStatus(statusId, "Transaction confirmed: " + txLink(tx.hash), "ok");
+  return null;
+}
+
+async function payFlow(id, statusId) {
+  setStatus(statusId, "Reading invoice " + id + " from the contract...", "wait");
+  const inv = await pay.getInvoice(id);
+  if (STATUS[Number(inv.status)] !== "Open") throw new Error("Invoice " + id + " is " + STATUS[Number(inv.status)] + ", so it cannot be paid.");
+  if (inv.payer.toLowerCase() !== myAddr.toLowerCase()) {
+    throw new Error("This invoice names payer " + shortAddr(inv.payer) + " but you are connected as " + shortAddr(myAddr) + ". Switch accounts in your wallet.");
+  }
+  const amountText = ethers.formatUnits(inv.amount, 6);
+  const bal = await token.balanceOf(myAddr);
+  if (bal < inv.amount) throw new Error("Your tUSD8 balance (" + ethers.formatUnits(bal, 6) + ") is below the invoice amount (" + amountText + "). Top up from the faucet first.");
+  const contractAddr = await pay.getAddress();
+  const currentAllowance = await token.allowance(myAddr, contractAddr);
+  if (currentAllowance < inv.amount) {
+    setStatus(statusId, "Step 1 of 2: approve " + amountText + " tUSD8 in your wallet...", "wait");
+    const ap = await token.approve(contractAddr, inv.amount);
+    setStatus(statusId, "Approval sent, waiting for confirmation: " + txLink(ap.hash), "wait");
+    await ap.wait();
+    log("Approved " + amountText + " tUSD8: " + ap.hash);
+  } else {
+    log("Allowance already covers the invoice, skipping approval.");
+  }
+  setStatus(statusId, "Step 2 of 2: confirm the payment in your wallet...", "wait");
+  const tx = await pay.payInvoice(id);
+  setStatus(statusId, "Payment sent, waiting for confirmation: " + txLink(tx.hash), "wait");
+  await tx.wait();
+  setStatus(statusId, "Invoice " + id + " paid. " + amountText + " tUSD8 went straight to the merchant. Tx: " + txLink(tx.hash), "ok");
+  log("Invoice " + id + " paid: " + tx.hash);
 }
 
 $("connect").onclick = async () => {
@@ -250,7 +358,7 @@ $("connect").onclick = async () => {
     if (!ethers.isAddress(tokenAddr)) throw new Error("The tUSD8 token address above is not a valid address.");
     pay = new ethers.Contract(contractAddr, PAY_ABI, signer);
     token = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-    ["create", "pay", "cancel", "refresh"].forEach((id) => ($(id).disabled = false));
+    ["create", "pay", "cancel", "refresh", "guideCreate", "guideDuplicate", "guidePay"].forEach((id) => ($(id).disabled = false));
     log("Connected as " + myAddr + " on QDay Aevum testnet.");
     await refreshBalances();
     await refreshList();
@@ -262,29 +370,8 @@ $("connect").onclick = async () => {
 
 $("create").onclick = async () => {
   try {
-    const payer = $("payer").value.trim();
-    if (!ethers.isAddress(payer)) throw new Error("Enter the payer wallet address (it starts with 0x).");
-    if (payer.toLowerCase() === myAddr.toLowerCase()) throw new Error("The payer should be a different wallet than the merchant. Switch accounts for the payment step.");
-    const amountText = $("amount").value;
-    const amount = ethers.parseUnits(amountText, 6);
-    if (amount === 0n) throw new Error("The amount must be more than zero.");
-    const days = Number($("days").value);
-    if (!days || days < 1) throw new Error("Due in days must be at least 1.");
-    const due = Math.floor(Date.now() / 1000) + days * 86400;
-    setStatus("createStatus", "Waiting for your wallet confirmation...", "wait");
-    const tx = await pay.createInvoice(payer, amount, due, $("memo").value);
-    setStatus("createStatus", "Invoice transaction sent, waiting for confirmation: " + txLink(tx.hash), "wait");
-    log("createInvoice sent: " + tx.hash);
-    const receipt = await tx.wait();
-    const ev = receipt.logs.map((l) => { try { return pay.interface.parseLog(l); } catch { return null; } })
-      .find((p) => p && p.name === "InvoiceCreated");
-    if (ev) {
-      $("invoiceId").value = ev.args.invoiceId.toString();
-      setStatus("createStatus", "Invoice " + ev.args.invoiceId + " created for " + amountText + " tUSD8. Tx: " + txLink(tx.hash), "ok");
-      log("Invoice created, id " + ev.args.invoiceId + ".");
-    } else {
-      setStatus("createStatus", "Transaction confirmed: " + txLink(tx.hash), "ok");
-    }
+    const payer = readCreateInputs();
+    await createInvoiceFlow(payer, $("amount").value, $("poRef").value.trim(), $("memo").value, "createStatus");
     await refreshList();
   } catch (e) {
     setStatus("createStatus", friendlyError(e), "bad");
@@ -292,35 +379,67 @@ $("create").onclick = async () => {
   }
 };
 
+$("guideCreate").onclick = async () => {
+  try {
+    const payer = readCreateInputs();
+    const poText = $("guidePo").value.trim();
+    const [active, boundId] = await pay.purchaseOrderStatus(myAddr, poHash(poText));
+    if (active) throw new Error("Purchase order \"" + poText + "\" already has invoice " + boundId + " from you. Pick a fresh purchase order text for this check, or cancel invoice " + boundId + " first.");
+    guideInvoiceId = await createInvoiceFlow(payer, $("guideAmount").value, poText, "Guided check invoice for " + poText, "guideCreateStatus");
+    await refreshList();
+  } catch (e) {
+    setStatus("guideCreateStatus", friendlyError(e), "bad");
+    log("Guided create failed: " + friendlyError(e));
+  }
+};
+
+$("guideDuplicate").onclick = async () => {
+  try {
+    const payer = readCreateInputs();
+    const poText = $("guidePo").value.trim();
+    const [active, boundId] = await pay.purchaseOrderStatus(myAddr, poHash(poText));
+    if (!active) throw new Error("No invoice exists yet for purchase order \"" + poText + "\". Run step A first.");
+    setStatus("guideDuplicateStatus", "Purchase order \"" + poText + "\" is bound to invoice " + boundId + ". Now trying a second invoice for it. Confirm in your wallet; the contract should reject it.", "wait");
+    const amount = ethers.parseUnits($("guideAmount").value, 6);
+    const due = Math.floor(Date.now() / 1000) + 7 * 86400;
+    const tx = await pay.createInvoice(payer, amount, due, "Duplicate for " + poText, poHash(poText));
+    await tx.wait();
+    setStatus("guideDuplicateStatus", "Unexpected: the duplicate was accepted. Tx: " + txLink(tx.hash), "bad");
+    log("Duplicate was accepted (unexpected): " + tx.hash);
+    await refreshList();
+  } catch (e) {
+    const msg = friendlyError(e);
+    if (msg.startsWith("Rejected:")) {
+      setStatus("guideDuplicateStatus", "Rejected as intended. " + msg, "ok");
+      log("Duplicate rejected as intended.");
+    } else {
+      setStatus("guideDuplicateStatus", msg, "bad");
+      log("Duplicate attempt ended with: " + msg);
+    }
+  }
+};
+
+$("guidePay").onclick = async () => {
+  try {
+    let id = guideInvoiceId;
+    if (id === null) {
+      const poText = $("guidePo").value.trim();
+      const [active, boundId] = await pay.purchaseOrderStatus(myAddr, poHash(poText));
+      if (!active) throw new Error("No invoice found for purchase order \"" + poText + "\" from the connected merchant account. Run step A as the merchant first, then switch to the payer account for this step.");
+      id = boundId;
+    }
+    await payFlow(id, "guidePayStatus");
+    await refreshBalances();
+    await refreshList();
+  } catch (e) {
+    setStatus("guidePayStatus", friendlyError(e), "bad");
+    log("Guided pay failed: " + friendlyError(e));
+  }
+};
+
 $("pay").onclick = async () => {
   try {
-    const id = $("invoiceId").value;
-    setStatus("payStatus", "Reading invoice " + id + " from the contract...", "wait");
-    const inv = await pay.getInvoice(id);
-    if (STATUS[Number(inv.status)] !== "Open") throw new Error("Invoice " + id + " is " + STATUS[Number(inv.status)] + ", so it cannot be paid.");
-    if (inv.payer.toLowerCase() !== myAddr.toLowerCase()) {
-      throw new Error("This invoice names payer " + shortAddr(inv.payer) + " but you are connected as " + shortAddr(myAddr) + ". Switch accounts in your wallet.");
-    }
-    const amountText = ethers.formatUnits(inv.amount, 6);
-    const bal = await token.balanceOf(myAddr);
-    if (bal < inv.amount) throw new Error("Your tUSD8 balance (" + ethers.formatUnits(bal, 6) + ") is below the invoice amount (" + amountText + "). Top up from the faucet first.");
-    const contractAddr = await pay.getAddress();
-    const currentAllowance = await token.allowance(myAddr, contractAddr);
-    if (currentAllowance < inv.amount) {
-      setStatus("payStatus", "Step 1 of 2: approve " + amountText + " tUSD8 in your wallet...", "wait");
-      const ap = await token.approve(contractAddr, inv.amount);
-      setStatus("payStatus", "Approval sent, waiting for confirmation: " + txLink(ap.hash), "wait");
-      await ap.wait();
-      log("Approved " + amountText + " tUSD8: " + ap.hash);
-    } else {
-      log("Allowance already covers the invoice, skipping approval.");
-    }
-    setStatus("payStatus", "Step 2 of 2: confirm the payment in your wallet...", "wait");
-    const tx = await pay.payInvoice(id);
-    setStatus("payStatus", "Payment sent, waiting for confirmation: " + txLink(tx.hash), "wait");
-    await tx.wait();
-    setStatus("payStatus", "Invoice " + id + " paid. " + amountText + " tUSD8 went straight to the merchant. Tx: " + txLink(tx.hash), "ok");
-    log("Invoice " + id + " paid: " + tx.hash);
+    await payFlow($("invoiceId").value, "payStatus");
     await refreshBalances();
     await refreshList();
   } catch (e) {
@@ -335,7 +454,7 @@ $("cancel").onclick = async () => {
     setStatus("payStatus", "Cancelling invoice " + id + "...", "wait");
     const tx = await pay.cancelInvoice(id);
     await tx.wait();
-    setStatus("payStatus", "Invoice " + id + " cancelled. Tx: " + txLink(tx.hash), "ok");
+    setStatus("payStatus", "Invoice " + id + " cancelled. Its purchase order reference is free again. Tx: " + txLink(tx.hash), "ok");
     log("Invoice " + id + " cancelled: " + tx.hash);
     await refreshList();
   } catch (e) {
