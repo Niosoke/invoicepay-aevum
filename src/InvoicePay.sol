@@ -15,14 +15,19 @@ interface IERC20 {
 /// @notice On-chain stablecoin invoices for the QDay Aevum testnet.
 /// @dev A merchant creates an invoice denominated in tUSD8 (the Aevum test
 ///      stablecoin, 6 decimals). Every invoice is bound to a purchase order
-///      reference (a bytes32 hash of the off-chain purchase order). The
-///      contract rejects a second invoice for the same purchase order from
-///      the same merchant while the first is not cancelled, so one purchase
-///      order can only ever be settled once. Cancelling an invoice frees
-///      its purchase order reference. The named payer settles the exact
-///      amount; the contract pulls the tokens straight to the merchant with
-///      `transferFrom`, marks the invoice paid and emits an event.
-///      The contract never custodies funds.
+///      reference (a bytes32 hash of the off-chain purchase order) that the
+///      payer has approved on chain beforehand: `approvePurchaseOrder`
+///      records which merchant may bill against the reference, the total
+///      amount cap, and an expiry. The merchant can then create invoices
+///      against that approval, in full or in parts, but the settled plus
+///      reserved total can never exceed the approved cap. Once the cap is
+///      fully settled the purchase order is locked forever, so one
+///      approved purchase order can never be settled beyond its approved
+///      total. Cancelling an unpaid invoice releases its reservation.
+///      The named payer settles each invoice in full; the contract pulls
+///      the tokens straight to the merchant with `transferFrom`, marks the
+///      invoice paid and emits an event. The contract never custodies
+///      funds.
 contract InvoicePay {
     enum Status {
         Open,
@@ -41,20 +46,36 @@ contract InvoicePay {
         Status status;
     }
 
+    /// @notice A purchase order approved by a payer.
+    /// @dev Invariant: settled + live <= amount at all times. `live` is the
+    ///      sum of the amounts of open invoices against this purchase
+    ///      order, so a merchant cannot reserve more than the cap with
+    ///      unpaid invoices either.
+    struct PurchaseOrder {
+        address merchant; // the only merchant allowed to bill this reference
+        uint256 amount; // approved total cap, in token base units
+        uint256 expiry; // unix timestamp; new invoices are rejected after it
+        uint256 settled; // amount already paid against this purchase order
+        uint256 live; // amount reserved by open invoices
+        bool exists;
+    }
+
     /// @notice The stablecoin every invoice is denominated in (tUSD8 on Aevum).
     IERC20 public immutable token;
 
     /// @notice All invoices ever created. The array index is the invoice id.
     Invoice[] public invoices;
 
-    /// @dev Active invoice per purchase order, keyed by merchant and poRef.
-    ///      Stores invoiceId + 1 so that 0 means "no active invoice".
-    ///      An entry is removed only when its invoice is cancelled, so a
-    ///      paid purchase order stays locked forever.
-    mapping(bytes32 => uint256) private _poInvoice;
+    /// @dev Purchase order approvals, keyed by payer and poRef. The payer
+    ///      is the approver, so the same reference approved by two
+    ///      different payers is two independent purchase orders.
+    mapping(bytes32 => PurchaseOrder) private _purchaseOrders;
 
     uint256 private _lock = 1;
 
+    event PurchaseOrderApproved(
+        address indexed payer, address indexed merchant, bytes32 indexed poRef, uint256 amount, uint256 expiry
+    );
     event InvoiceCreated(
         uint256 indexed invoiceId,
         address indexed merchant,
@@ -70,6 +91,7 @@ contract InvoicePay {
     error ZeroAddress();
     error ZeroAmount();
     error DueDateInPast();
+    error ExpiryInPast();
     error InvoiceNotFound();
     error NotPayer();
     error NotMerchant();
@@ -78,6 +100,11 @@ contract InvoicePay {
     error ReentrantCall();
     error ZeroPurchaseOrder();
     error DuplicatePurchaseOrder();
+    error PurchaseOrderNotApproved();
+    error PurchaseOrderAlreadyApproved();
+    error WrongMerchant();
+    error PurchaseOrderExpired();
+    error AmountExceedsApproval();
 
     modifier nonReentrant() {
         if (_lock != 1) revert ReentrantCall();
@@ -91,16 +118,55 @@ contract InvoicePay {
         token = IERC20(tokenAddress);
     }
 
-    /// @notice Create a new invoice bound to a purchase order. The caller
-    ///         becomes the merchant. Reverts if this merchant already has a
-    ///         non-cancelled invoice for the same purchase order reference.
-    /// @param payer The only address allowed to settle this invoice.
+    /// @notice Approve a purchase order. The caller is the payer: only this
+    ///         payer can later be billed against the reference, and only by
+    ///         the named merchant, up to the approved total, until expiry.
+    ///         An approval that has not been used yet (nothing settled and
+    ///         no open invoice) can be replaced by approving again; once
+    ///         money is reserved or settled against it, its terms are
+    ///         locked.
+    /// @param merchant The only merchant allowed to create invoices
+    ///        against this purchase order.
+    /// @param poRef Hash of the purchase order, e.g. keccak256("PO 1042").
+    /// @param amount Approved total cap in token base units. Invoices may
+    ///        settle it in parts, but never beyond this total.
+    /// @param expiry Unix timestamp after which new invoices against this
+    ///        purchase order are rejected. Invoices created before expiry
+    ///        can still be paid afterwards.
+    function approvePurchaseOrder(address merchant, bytes32 poRef, uint256 amount, uint256 expiry) external {
+        if (merchant == address(0)) revert ZeroAddress();
+        if (poRef == bytes32(0)) revert ZeroPurchaseOrder();
+        if (amount == 0) revert ZeroAmount();
+        if (expiry <= block.timestamp) revert ExpiryInPast();
+
+        PurchaseOrder storage po = _purchaseOrders[_poKey(msg.sender, poRef)];
+        if (po.exists && (po.settled != 0 || po.live != 0)) revert PurchaseOrderAlreadyApproved();
+
+        po.merchant = merchant;
+        po.amount = amount;
+        po.expiry = expiry;
+        po.settled = 0;
+        po.live = 0;
+        po.exists = true;
+
+        emit PurchaseOrderApproved(msg.sender, merchant, poRef, amount, expiry);
+    }
+
+    /// @notice Create a new invoice against a purchase order the payer has
+    ///         approved. The caller becomes the merchant and must be the
+    ///         merchant named in the approval. Reverts when there is no
+    ///         approval, the approval names another merchant, the approval
+    ///         has expired, the purchase order is already fully settled, or
+    ///         the amount would push the settled plus reserved total past
+    ///         the approved cap.
+    /// @param payer The only address allowed to settle this invoice. Must
+    ///        have approved this purchase order for the caller.
     /// @param amount Amount in token base units (e.g. 25_000000 = 25 tUSD8).
     /// @param dueDate Unix timestamp after which the invoice is overdue.
     /// @param memo Human readable note, e.g. "Invoice #1042, design work".
     /// @param poRef Hash of the purchase order being settled, e.g.
-    ///        keccak256("PO 1042"). Must be non-zero and unique per merchant
-    ///        among non-cancelled invoices.
+    ///        keccak256("PO 1042"). Must be non-zero and approved by the
+    ///        payer for the caller.
     /// @return invoiceId Id of the new invoice.
     function createInvoice(address payer, uint256 amount, uint256 dueDate, string calldata memo, bytes32 poRef)
         external
@@ -111,8 +177,14 @@ contract InvoicePay {
         if (dueDate <= block.timestamp) revert DueDateInPast();
         if (poRef == bytes32(0)) revert ZeroPurchaseOrder();
 
-        bytes32 key = _poKey(msg.sender, poRef);
-        if (_poInvoice[key] != 0) revert DuplicatePurchaseOrder();
+        PurchaseOrder storage po = _purchaseOrders[_poKey(payer, poRef)];
+        if (!po.exists) revert PurchaseOrderNotApproved();
+        if (po.merchant != msg.sender) revert WrongMerchant();
+        if (block.timestamp > po.expiry) revert PurchaseOrderExpired();
+        if (po.settled == po.amount) revert DuplicatePurchaseOrder();
+        if (amount > po.amount - po.settled - po.live) revert AmountExceedsApproval();
+
+        po.live += amount;
 
         invoiceId = invoices.length;
         invoices.push(
@@ -127,7 +199,6 @@ contract InvoicePay {
                 status: Status.Open
             })
         );
-        _poInvoice[key] = invoiceId + 1;
 
         emit InvoiceCreated(invoiceId, msg.sender, payer, amount, dueDate, memo, poRef);
     }
@@ -135,6 +206,8 @@ contract InvoicePay {
     /// @notice Settle an invoice in full. The payer must first approve this
     ///         contract to spend at least the invoice amount of tUSD8.
     ///         Funds go directly to the merchant; nothing is custodied here.
+    ///         The payment moves the invoice amount from the reserved total
+    ///         to the settled total of its purchase order.
     function payInvoice(uint256 invoiceId) external nonReentrant {
         if (invoiceId >= invoices.length) revert InvoiceNotFound();
         Invoice storage inv = invoices[invoiceId];
@@ -145,6 +218,10 @@ contract InvoicePay {
         inv.status = Status.Paid;
         inv.paidAt = block.timestamp;
 
+        PurchaseOrder storage po = _purchaseOrders[_poKey(inv.payer, inv.poRef)];
+        po.live -= inv.amount;
+        po.settled += inv.amount;
+
         bool ok = token.transferFrom(msg.sender, inv.merchant, inv.amount);
         if (!ok) revert TransferFailed();
 
@@ -152,8 +229,8 @@ contract InvoicePay {
     }
 
     /// @notice Cancel an unpaid invoice. Only the merchant can cancel.
-    ///         Cancelling frees the purchase order reference, so a fresh
-    ///         invoice can be created for the same purchase order.
+    ///         Cancelling releases the amount the invoice reserved against
+    ///         its purchase order, so a corrected invoice can be created.
     function cancelInvoice(uint256 invoiceId) external {
         if (invoiceId >= invoices.length) revert InvoiceNotFound();
         Invoice storage inv = invoices[invoiceId];
@@ -161,7 +238,7 @@ contract InvoicePay {
         if (inv.status != Status.Open) revert InvoiceNotOpen();
 
         inv.status = Status.Cancelled;
-        delete _poInvoice[_poKey(inv.merchant, inv.poRef)];
+        _purchaseOrders[_poKey(inv.payer, inv.poRef)].live -= inv.amount;
         emit InvoiceCancelled(invoiceId, msg.sender);
     }
 
@@ -183,16 +260,23 @@ contract InvoicePay {
         return invoices.length;
     }
 
-    /// @notice Look up the active invoice bound to a purchase order.
-    /// @return active True when a non-cancelled invoice exists for the pair.
-    /// @return invoiceId The bound invoice id (meaningful only if active).
-    function purchaseOrderStatus(address merchant, bytes32 poRef) external view returns (bool active, uint256 invoiceId) {
-        uint256 stored = _poInvoice[_poKey(merchant, poRef)];
-        if (stored == 0) return (false, 0);
-        return (true, stored - 1);
+    /// @notice Read the purchase order a payer approved for a reference.
+    ///         Returns a record with exists set to false when the payer
+    ///         has not approved that reference.
+    function getPurchaseOrder(address payer, bytes32 poRef) external view returns (PurchaseOrder memory) {
+        return _purchaseOrders[_poKey(payer, poRef)];
     }
 
-    function _poKey(address merchant, bytes32 poRef) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(merchant, poRef));
+    /// @notice Amount still available under an approved purchase order:
+    ///         the approved cap minus what is settled and what open
+    ///         invoices reserve. Zero when there is no approval.
+    function purchaseOrderRemaining(address payer, bytes32 poRef) external view returns (uint256) {
+        PurchaseOrder storage po = _purchaseOrders[_poKey(payer, poRef)];
+        if (!po.exists) return 0;
+        return po.amount - po.settled - po.live;
+    }
+
+    function _poKey(address payer, bytes32 poRef) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(payer, poRef));
     }
 }
