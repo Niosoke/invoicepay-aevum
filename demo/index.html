@@ -161,7 +161,7 @@
       <p class="status" id="guideDuplicateStatus"></p>
     </div>
     <div class="guide-step">
-      <p class="hint"><strong>Step E.</strong> Switch back to the payer account and pay both installments. Each settles exactly once, and both milestones stay locked afterwards.</p>
+      <p class="hint"><strong>Step E.</strong> Switch back to the payer account and pay both installments. Each settles exactly once, and both milestones stay locked afterwards. This step is safe to resume: if you reload the page after paying the first installment, it finds both installment invoices again, pays only the one still open, and reads both statuses back before it reports the outcome. A confirmed payment always shows its transaction hash and proof first, even if a later status reload fails.</p>
       <button id="guidePay" disabled>Pay both installments</button>
       <p class="status" id="guidePayStatus"></p>
       <div id="guideProof"></div>
@@ -170,8 +170,12 @@
 
   <section>
     <h2>4. Payer: invoices addressed to you</h2>
-    <p class="hint">Switch to the payer account, then load your invoices. For each one the demo reads your purchase order approval and the milestone claim from the contract so you can verify the merchant, the amount, the milestone it bills, and how much of the approved total is already settled before you pay. After payment you get a settlement proof you can copy into your records.</p>
+    <p class="hint">Switch to the payer account, then load your invoices. The list is found through InvoiceCreated events filtered by your payer address, so the demo reads only your invoices instead of scanning the whole contract history. If the event query is unavailable it falls back to a bounded scan of the most recent invoices and says so. You can also look up one invoice directly by id. For each invoice the demo reads your purchase order approval and the milestone claim from the contract so you can verify the merchant, the amount, the milestone it bills, and how much of the approved total is already settled before you pay. After payment you get a settlement proof you can copy into your records. The proof appears as soon as the payment receipt succeeds and stays on screen even if a later status reload fails.</p>
     <button id="loadMine" disabled class="secondary">Load my invoices</button>
+    <div class="row">
+      <div><label>Invoice id to look up directly</label><input id="lookupId" type="number" min="0" value="0" /></div>
+    </div>
+    <button id="lookupMine" disabled class="ghost">Look up invoice by id</button>
     <p class="status" id="mineStatus"></p>
     <div id="mineWrap"></div>
     <div id="proofWrap"></div>
@@ -331,6 +335,63 @@ function friendlyError(e) {
 
 let signer, pay, token, myAddr;
 let guideInvoiceIds = [];
+// Settlement proofs keyed by invoice id, kept so a confirmed payment
+// stays on screen (with a reload action) even if a later status read
+// fails. A proof is stored the moment its receipt succeeds.
+const proofStore = {};
+
+// Pure helper: locate both guided installment invoice ids through the
+// milestone claims, whatever their status. Resuming after installment
+// one is already Paid must still find both ids; filtering to Open
+// invoices here was the resume bug, because the final check then
+// never saw the paid installment.
+async function locateGuideInstallmentsWith(payContract, payer, poText, hashFn) {
+  const ids = [];
+  for (const suffix of [" milestone 1", " milestone 2"]) {
+    const msText = poText + suffix;
+    const ms = await payContract.milestoneStatus(payer, hashFn(poText), hashFn(msText));
+    if (!ms.used) return { ids, missing: msText };
+    ids.push(ms.invoiceId);
+  }
+  return { ids, missing: null };
+}
+async function readStatusesWith(payContract, ids) {
+  const statuses = [];
+  for (const id of ids) {
+    const inv = await payContract.getInvoice(id);
+    statuses.push(STATUS[Number(inv.status)]);
+  }
+  return statuses;
+}
+// Pure helper: the guided outcome is "both paid" only when two
+// invoices were located and both read back Paid.
+function guideOutcome(ids, statuses) {
+  const bothPaid = ids.length === 2 && statuses.length === 2 && statuses.every((s) => s === "Paid");
+  return { bothPaid };
+}
+// Build a settlement proof from a successful receipt. The InvoicePaid
+// event in the receipt carries paidAt, so the proof is complete
+// without any further contract read.
+function proofFromReceipt(receipt, invoiceId, invBefore, hash, payContract) {
+  let paidAt = null;
+  try {
+    const ev = (receipt.logs || []).map((l) => { try { return payContract.interface.parseLog(l); } catch { return null; } })
+      .find((p) => p && p.name === "InvoicePaid");
+    if (ev && ev.args && ev.args.paidAt !== undefined) paidAt = ev.args.paidAt;
+  } catch (e) { /* proof still stands on the receipt alone */ }
+  return {
+    invoiceId,
+    poRef: invBefore.poRef,
+    milestoneRef: invBefore.milestoneRef,
+    merchant: invBefore.merchant,
+    payer: invBefore.payer,
+    amountText: fmtAmt(invBefore.amount),
+    hash,
+    blockNumber: receipt.blockNumber,
+    paidAt,
+    statusReadFailed: false,
+  };
+}
 
 async function refreshBalances() {
   if (!signer) return;
@@ -434,7 +495,8 @@ async function createInvoiceFlow(payer, amountText, poText, milestoneText, memo,
   return null;
 }
 
-async function payFlow(id, statusId) {
+async function payFlow(id, statusId, opts) {
+  const onProof = opts && opts.onProof ? opts.onProof : null;
   setStatus(statusId, "Reading invoice " + id + " from the contract...", "wait");
   const inv = await pay.getInvoice(id);
   if (STATUS[Number(inv.status)] !== "Open") throw new Error("Invoice " + id + " is " + STATUS[Number(inv.status)] + ", so it cannot be paid.");
@@ -459,23 +521,67 @@ async function payFlow(id, statusId) {
   const tx = await pay.payInvoice(id);
   setStatus(statusId, "Payment sent, waiting for confirmation: " + txLink(tx.hash), "wait");
   const receipt = await tx.wait();
-  const after = await pay.getInvoice(id);
+  // The money has moved. Build and show the proof right now, from the
+  // receipt alone, before any further contract read. From here on a
+  // failing read must never turn this confirmed payment into a bare
+  // error or hide the transaction hash.
+  const proof = proofFromReceipt(receipt, id, inv, tx.hash, pay);
+  proofStore[String(id)] = proof;
   setStatus(statusId, "Invoice " + id + " paid. " + amountText + " tUSD8 went straight to the merchant. Tx: " + txLink(tx.hash), "ok");
   log("Invoice " + id + " paid: " + tx.hash);
-  return {
-    invoiceId: id,
-    poRef: inv.poRef,
-    milestoneRef: inv.milestoneRef,
-    merchant: inv.merchant,
-    payer: inv.payer,
-    amountText,
-    hash: tx.hash,
-    blockNumber: receipt.blockNumber,
-    paidAt: after.paidAt,
-  };
+  if (onProof) {
+    try { onProof(proof); } catch (e) { /* rendering must not fail the payment */ }
+  }
+  try {
+    const after = await pay.getInvoice(id);
+    proof.paidAt = after.paidAt;
+    proof.statusReadFailed = false;
+    if (onProof) {
+      try { onProof(proof); } catch (e) { /* keep the first render */ }
+    }
+  } catch (readErr) {
+    proof.statusReadFailed = true;
+    setStatus(statusId, "Invoice " + id + " paid and confirmed. Tx: " + txLink(tx.hash) + ". The follow up status reload failed (" + friendlyError(readErr) + "), so the proof below is shown from the receipt. Use its Reload status button to read the invoice again.", "ok");
+    log("Invoice " + id + " paid, status reload failed after confirmation: " + friendlyError(readErr));
+    if (onProof) {
+      try { onProof(proof); } catch (e) { /* keep the first render */ }
+    }
+  }
+  return proof;
+}
+
+// Best effort proof for an invoice that is already Paid in a fresh
+// session: recover its payment transaction from the InvoicePaid
+// event so a resumed demo can still show evidence.
+async function fetchPaidProof(id, inv) {
+  try {
+    const filter = pay.filters.InvoicePaid(id);
+    const events = await pay.queryFilter(filter, 0, "latest");
+    const ev = events[events.length - 1];
+    if (!ev) return null;
+    const proof = {
+      invoiceId: id,
+      poRef: inv.poRef,
+      milestoneRef: inv.milestoneRef,
+      merchant: inv.merchant,
+      payer: inv.payer,
+      amountText: fmtAmt(inv.amount),
+      hash: ev.transactionHash,
+      blockNumber: ev.blockNumber,
+      paidAt: ev.args && ev.args.paidAt !== undefined ? ev.args.paidAt : inv.paidAt,
+      statusReadFailed: false,
+    };
+    proofStore[String(id)] = proof;
+    return proof;
+  } catch (e) {
+    return null;
+  }
 }
 
 function proofHtml(p) {
+  const paidAtText = p.paidAt === null || p.paidAt === undefined || Number(p.paidAt) === 0
+    ? "confirmed in block " + p.blockNumber + " (exact time pending reload)"
+    : fmtDate(p.paidAt);
   const text =
     "InvoicePay settlement proof\n" +
     "Invoice id: " + p.invoiceId + "\n" +
@@ -485,16 +591,48 @@ function proofHtml(p) {
     "Payer: " + p.payer + "\n" +
     "Amount: " + p.amountText + " tUSD8\n" +
     "Status: Paid\n" +
-    "Paid at: " + fmtDate(p.paidAt) + "\n" +
+    "Paid at: " + paidAtText + "\n" +
     "Block: " + p.blockNumber + "\n" +
     "Transaction: " + p.hash + "\n" +
     "Explorer: " + EXPLORER + "/tx/" + p.hash;
+  const reloadNote = p.statusReadFailed
+    ? '<p class="small">The payment is confirmed. Only the follow up status reload failed, so this proof is shown from the receipt. Reload the status to fill in the exact paid time.</p>'
+    : "";
   return '<div class="proof"><h3 style="margin:0 0 8px;font-size:14.5px;">Settlement proof</h3>' +
+    reloadNote +
     "<pre>" + escapeHtml(text) + "</pre>" +
-    '<button class="ghost" data-copy="' + encodeURIComponent(text) + '">Copy proof for your records</button></div>';
+    '<button class="ghost" data-copy="' + encodeURIComponent(text) + '">Copy proof for your records</button> ' +
+    '<button class="ghost" data-reload-proof="' + p.invoiceId + '">Reload status</button>' +
+    '<p class="status" id="reloadStatus' + p.invoiceId + '"></p></div>';
 }
 
 document.addEventListener("click", async (e) => {
+  const reloadBtn = e.target.closest("[data-reload-proof]");
+  if (reloadBtn) {
+    const id = reloadBtn.getAttribute("data-reload-proof");
+    const proof = proofStore[String(id)];
+    try {
+      reloadBtn.disabled = true;
+      const inv = await pay.getInvoice(id);
+      const status = STATUS[Number(inv.status)];
+      if (proof) {
+        proof.paidAt = inv.paidAt;
+        proof.statusReadFailed = false;
+        const wrap = reloadBtn.closest(".proof");
+        if (wrap) {
+          const holder = document.createElement("div");
+          holder.innerHTML = proofHtml(proof);
+          wrap.replaceWith(holder.firstChild);
+        }
+      }
+      setStatus("reloadStatus" + id, "Status reloaded: invoice " + id + " reads " + status + (Number(inv.paidAt) > 0 ? ", paid at " + fmtDate(inv.paidAt) : "") + ".", "ok");
+      log("Reloaded status for invoice " + id + ": " + status + ".");
+    } catch (err) {
+      setStatus("reloadStatus" + id, "Reload failed (" + friendlyError(err) + "). The confirmed proof above stays as it is; try reloading again in a moment.", "bad");
+      reloadBtn.disabled = false;
+    }
+    return;
+  }
   const btn = e.target.closest("[data-copy]");
   if (!btn) return;
   const text = decodeURIComponent(btn.getAttribute("data-copy"));
@@ -513,60 +651,56 @@ document.addEventListener("click", async (e) => {
   setTimeout(() => (btn.textContent = "Copy proof for your records"), 2000);
 });
 
-async function loadMyInvoices() {
-  setStatus("mineStatus", "Reading invoices addressed to " + shortAddr(myAddr) + "...", "wait");
-  const count = Number(await pay.invoiceCount());
-  let html = "";
-  let mine = 0;
-  for (let i = 0; i < count; i++) {
-    const inv = await pay.getInvoice(i);
-    if (inv.payer.toLowerCase() !== myAddr.toLowerCase()) continue;
-    mine++;
-    const status = STATUS[Number(inv.status)];
-    let badge = '<span class="badge ' + status.toLowerCase() + '">' + status + "</span>";
-    if (status === "Open" && (await pay.isOverdue(i))) badge += ' <span class="badge overdue">Overdue</span>';
-    const po = await pay.getPurchaseOrder(myAddr, inv.poRef);
-    let verify;
-    if (!po.exists) {
-      verify = "No approval of yours matches this purchase order hash. Do not pay until you recognise it.";
-    } else if (po.merchant.toLowerCase() !== inv.merchant.toLowerCase()) {
-      verify = "Warning: you approved this purchase order for merchant " + shortAddr(po.merchant) + ", but this invoice names " + shortAddr(inv.merchant) + ".";
-    } else {
-      verify = "Matches your approval: cap " + fmtAmt(po.amount) + " tUSD8, settled " + fmtAmt(po.settled) +
-        ", reserved by open invoices " + fmtAmt(po.live) + ", still available " + fmtAmt(po.amount - po.settled - po.live) +
-        ", approval expiry " + fmtDate(po.expiry) + ".";
-    }
-    const ms = await pay.milestoneStatus(myAddr, inv.poRef, inv.milestoneRef);
-    const msCheck = ms.used
-      ? "This milestone is claimed by invoice " + ms.invoiceId + " (status " + STATUS[Number(ms.status)] + "), so it cannot be billed again under this purchase order."
-      : "This milestone is not claimed under your approval. That should not happen for an invoice created by the contract; do not pay until you recognise it.";
-    html += '<div class="card"><h3>Invoice ' + i + " " + badge + '</h3><p class="kv">' +
-      "<b>Memo:</b> " + escapeHtml(inv.memo) + "<br>" +
-      "<b>Purchase order hash:</b> <span class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</span><br>" +
-      "<b>Milestone hash:</b> <span class=\"mono\" title=\"" + inv.milestoneRef + "\">" + shortHash(inv.milestoneRef) + "</span><br>" +
-      "<b>Merchant:</b> <span class=\"mono\">" + inv.merchant + "</span><br>" +
-      "<b>Amount:</b> " + fmtAmt(inv.amount) + " tUSD8<br>" +
-      "<b>Due:</b> " + fmtDate(inv.dueDate) + "<br>" +
-      (Number(inv.paidAt) > 0 ? "<b>Paid at:</b> " + fmtDate(inv.paidAt) + "<br>" : "") +
-      "<b>Your approval check:</b> " + verify + "<br>" +
-      "<b>Milestone check:</b> " + msCheck + "</p>" +
-      (status === "Open" ? '<button data-pay="' + i + '">Approve and pay invoice ' + i + "</button>" : "") +
-      '<p class="status" id="minePayStatus' + i + '"></p></div>';
+async function invoiceCardHtml(i, inv) {
+  const status = STATUS[Number(inv.status)];
+  let badge = '<span class="badge ' + status.toLowerCase() + '">' + status + "</span>";
+  if (status === "Open" && (await pay.isOverdue(i))) badge += ' <span class="badge overdue">Overdue</span>';
+  const po = await pay.getPurchaseOrder(myAddr, inv.poRef);
+  let verify;
+  if (!po.exists) {
+    verify = "No approval of yours matches this purchase order hash. Do not pay until you recognise it.";
+  } else if (po.merchant.toLowerCase() !== inv.merchant.toLowerCase()) {
+    verify = "Warning: you approved this purchase order for merchant " + shortAddr(po.merchant) + ", but this invoice names " + shortAddr(inv.merchant) + ".";
+  } else {
+    verify = "Matches your approval: cap " + fmtAmt(po.amount) + " tUSD8, settled " + fmtAmt(po.settled) +
+      ", reserved by open invoices " + fmtAmt(po.live) + ", still available " + fmtAmt(po.amount - po.settled - po.live) +
+      ", approval expiry " + fmtDate(po.expiry) + ".";
   }
-  $("mineWrap").innerHTML = mine === 0
-    ? '<p class="small">No invoices name your account as payer yet. When a merchant bills a purchase order you approved, it shows up here.</p>'
-    : html;
-  setStatus("mineStatus", "Found " + mine + " invoice(s) addressed to you.", "ok");
+  const ms = await pay.milestoneStatus(myAddr, inv.poRef, inv.milestoneRef);
+  const msCheck = ms.used
+    ? "This milestone is claimed by invoice " + ms.invoiceId + " (status " + STATUS[Number(ms.status)] + "), so it cannot be billed again under this purchase order."
+    : "This milestone is not claimed under your approval. That should not happen for an invoice created by the contract; do not pay until you recognise it.";
+  return '<div class="card"><h3>Invoice ' + i + " " + badge + '</h3><p class="kv">' +
+    "<b>Memo:</b> " + escapeHtml(inv.memo) + "<br>" +
+    "<b>Purchase order hash:</b> <span class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</span><br>" +
+    "<b>Milestone hash:</b> <span class=\"mono\" title=\"" + inv.milestoneRef + "\">" + shortHash(inv.milestoneRef) + "</span><br>" +
+    "<b>Merchant:</b> <span class=\"mono\">" + inv.merchant + "</span><br>" +
+    "<b>Amount:</b> " + fmtAmt(inv.amount) + " tUSD8<br>" +
+    "<b>Due:</b> " + fmtDate(inv.dueDate) + "<br>" +
+    (Number(inv.paidAt) > 0 ? "<b>Paid at:</b> " + fmtDate(inv.paidAt) + "<br>" : "") +
+    "<b>Your approval check:</b> " + verify + "<br>" +
+    "<b>Milestone check:</b> " + msCheck + "</p>" +
+    (status === "Open" ? '<button data-pay="' + i + '">Approve and pay invoice ' + i + "</button>" : "") +
+    '<p class="status" id="minePayStatus' + i + '"></p></div>';
+}
+
+function bindPayButtons() {
   document.querySelectorAll("[data-pay]").forEach((btn) => {
     btn.onclick = async () => {
       const id = btn.getAttribute("data-pay");
       try {
         btn.disabled = true;
-        const proof = await payFlow(id, "minePayStatus" + id);
-        $("proofWrap").innerHTML = proofHtml(proof);
-        await refreshBalances();
-        await loadMyInvoices();
-        await refreshList();
+        // The proof renders the moment the receipt succeeds. Refreshes
+        // after that are best effort: a failing reload must not turn a
+        // confirmed payment into an error or hide its proof.
+        await payFlow(id, "minePayStatus" + id, {
+          onProof: (proof) => { $("proofWrap").innerHTML = proofHtml(proof); },
+        });
+        try { await refreshBalances(); } catch (e) { /* best effort */ }
+        try { await loadMyInvoices(); } catch (e) {
+          setStatus("mineStatus", "Payment confirmed above. Reloading your invoice list failed (" + friendlyError(e) + "). Your proof stays on screen; load the list again in a moment.", "wait");
+        }
+        try { await refreshList(); } catch (e) { /* best effort */ }
       } catch (e) {
         setStatus("minePayStatus" + id, friendlyError(e), "bad");
         log("Pay failed: " + friendlyError(e));
@@ -574,6 +708,75 @@ async function loadMyInvoices() {
       }
     };
   });
+}
+
+// Find invoice ids addressed to the connected payer without reading
+// the whole contract history. InvoiceCreated indexes the payer
+// address, so an event filter returns exactly the payer invoices.
+// If the event query is unavailable (for example a node range
+// limit), fall back to a bounded scan of the most recent invoices
+// and report that bound honestly.
+const PAYER_SCAN_LIMIT = 500;
+async function fetchMyInvoiceIds() {
+  try {
+    const filter = pay.filters.InvoiceCreated(null, null, myAddr);
+    const events = await pay.queryFilter(filter, 0, "latest");
+    const seen = new Set();
+    const ids = [];
+    for (const ev of events) {
+      const id = ev.args.invoiceId;
+      const key = String(id);
+      if (!seen.has(key)) { seen.add(key); ids.push(id); }
+    }
+    ids.sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+    return { ids, source: "events" };
+  } catch (eventErr) {
+    const count = Number(await pay.invoiceCount());
+    const start = Math.max(0, count - PAYER_SCAN_LIMIT);
+    const ids = [];
+    for (let i = start; i < count; i++) {
+      const inv = await pay.getInvoice(i);
+      if (inv.payer.toLowerCase() === myAddr.toLowerCase()) ids.push(i);
+    }
+    return { ids, source: "bounded", scanned: count - start, total: count };
+  }
+}
+
+async function loadMyInvoices() {
+  setStatus("mineStatus", "Finding invoices addressed to " + shortAddr(myAddr) + " through InvoiceCreated events...", "wait");
+  const found = await fetchMyInvoiceIds();
+  let html = "";
+  for (const id of found.ids) {
+    const inv = await pay.getInvoice(id);
+    if (inv.payer.toLowerCase() !== myAddr.toLowerCase()) continue;
+    html += await invoiceCardHtml(id, inv);
+  }
+  const mine = found.ids.length;
+  $("mineWrap").innerHTML = mine === 0
+    ? '<p class="small">No invoices name your account as payer yet. When a merchant bills a purchase order you approved, it shows up here.</p>'
+    : html;
+  if (found.source === "events") {
+    setStatus("mineStatus", "Found " + mine + " invoice(s) addressed to you, via InvoiceCreated events filtered by your address.", "ok");
+  } else {
+    setStatus("mineStatus", "Found " + mine + " invoice(s) addressed to you. The event query was unavailable, so the demo scanned the most recent " + found.scanned + " of " + found.total + " invoices. Older invoices outside that window can be opened with the direct id lookup above.", "wait");
+  }
+  bindPayButtons();
+}
+
+async function lookupInvoiceById() {
+  const raw = $("lookupId").value;
+  const id = Number(raw);
+  if (raw === "" || !Number.isInteger(id) || id < 0) throw new Error("Enter an invoice id (0 or higher) to look up.");
+  setStatus("mineStatus", "Reading invoice " + id + " directly...", "wait");
+  const inv = await pay.getInvoice(id);
+  if (inv.payer.toLowerCase() !== myAddr.toLowerCase()) {
+    $("mineWrap").innerHTML = '<p class="small">Invoice ' + id + " names payer " + shortAddr(inv.payer) + ", not your connected account " + shortAddr(myAddr) + ". Switch to that payer account to verify and pay it here.</p>";
+    setStatus("mineStatus", "Invoice " + id + " is addressed to a different payer.", "wait");
+    return;
+  }
+  $("mineWrap").innerHTML = await invoiceCardHtml(id, inv);
+  setStatus("mineStatus", "Showing invoice " + id + " from a direct lookup.", "ok");
+  bindPayButtons();
 }
 
 $("connect").onclick = async () => {
@@ -590,7 +793,7 @@ $("connect").onclick = async () => {
     if (!ethers.isAddress(tokenAddr)) throw new Error("The tUSD8 token address above is not a valid address.");
     pay = new ethers.Contract(contractAddr, PAY_ABI, signer);
     token = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-    ["approvePo", "checkPo", "create", "cancel", "refresh", "loadMine", "guideApprove", "guideCreate", "guideCreate2", "guideDuplicate", "guidePay"].forEach((id) => ($(id).disabled = false));
+    ["approvePo", "checkPo", "create", "cancel", "refresh", "loadMine", "lookupMine", "guideApprove", "guideCreate", "guideCreate2", "guideDuplicate", "guidePay"].forEach((id) => ($(id).disabled = false));
     log("Connected as " + myAddr + " on QDay Aevum testnet.");
     await refreshBalances();
     await refreshList();
@@ -725,37 +928,77 @@ $("guideDuplicate").onclick = async () => {
 
 $("guidePay").onclick = async () => {
   try {
+    const payer = $("guidePayer").value.trim();
+    const poText = $("guidePo").value.trim();
+    if (!ethers.isAddress(payer)) throw new Error("Enter the payer wallet address for the check.");
+    if (!poText) throw new Error("Enter the purchase order reference for the check.");
+    if (payer.toLowerCase() !== myAddr.toLowerCase()) throw new Error("Step E runs as the payer. You are connected as " + shortAddr(myAddr) + " but the payer field says " + shortAddr(payer) + ". Switch accounts or fix the field.");
+    // Locate BOTH installment invoices through their milestone
+    // claims, whatever their status. This is what makes the step
+    // resumable: after a reload with installment one already Paid,
+    // both ids are still found, only the Open one is paid, and the
+    // final check reads both statuses back. The in memory ids from
+    // steps B and C are only a fallback if a claim lookup fails.
     let ids = guideInvoiceIds.filter((x) => x !== undefined && x !== null);
-    if (ids.length < 2) {
-      const payer = $("guidePayer").value.trim();
-      const poText = $("guidePo").value.trim();
-      ids = [];
-      for (const msText of [poText + " milestone 1", poText + " milestone 2"]) {
-        const ms = await pay.milestoneStatus(payer, poHash(poText), poHash(msText));
-        if (ms.used && STATUS[Number(ms.status)] === "Open") ids.push(ms.invoiceId);
+    try {
+      const located = await locateGuideInstallmentsWith(pay, payer, poText, poHash);
+      if (located.missing) {
+        throw new Error("No invoice claims " + located.missing + " yet for purchase order \"" + poText + "\". Run steps A to C first, then switch to the payer account for this step.");
       }
-      if (ids.length === 0) throw new Error("No open guided installments found for purchase order \"" + poText + "\". Run steps A to C first, then switch to the payer account for this step.");
+      ids = located.ids;
+      guideInvoiceIds = located.ids.slice();
+    } catch (locateErr) {
+      if (ids.length < 2) throw locateErr;
+      log("Milestone lookup failed, falling back to the ids from this session: " + friendlyError(locateErr));
     }
-    let lastProof = null;
-    for (const id of ids) {
-      lastProof = await payFlow(id, "guidePayStatus");
+    if (ids.length < 2) throw new Error("Both guided installments were not found for purchase order \"" + poText + "\". Run steps A to C first, then switch to the payer account for this step.");
+    // Read both statuses before paying, pay only what is still Open,
+    // and show a proof for every installment, including one paid in
+    // an earlier session (recovered from its InvoicePaid event).
+    const before = [];
+    for (const id of ids) before.push(await pay.getInvoice(id));
+    const proofs = [];
+    const renderProofs = () => {
+      $("guideProof").innerHTML = proofs.filter(Boolean).map(proofHtml).join("");
+    };
+    for (let k = 0; k < ids.length; k++) {
+      const id = ids[k];
+      const inv = before[k];
+      const status = STATUS[Number(inv.status)];
+      if (status === "Paid") {
+        setStatus("guidePayStatus", "Installment " + (k + 1) + " (invoice " + id + ") is already paid, skipping it. Checking the other installment...", "wait");
+        log("Guided installment " + (k + 1) + " already paid, skipping invoice " + id + ".");
+        proofs[k] = proofStore[String(id)] || (await fetchPaidProof(id, inv));
+        renderProofs();
+        continue;
+      }
+      if (status !== "Open") throw new Error("Invoice " + id + " is " + status + ", so the guided check cannot finish. Use a fresh purchase order reference and run steps A to E again.");
+      proofs[k] = await payFlow(id, "guidePayStatus", {
+        onProof: (proof) => { proofs[k] = proof; renderProofs(); },
+      });
+      renderProofs();
     }
-    if (lastProof) $("guideProof").innerHTML = proofHtml(lastProof);
     // Self check: only claim both installments paid after reading both
-    // invoice statuses back from the contract. One paid invoice is never
-    // reported as two.
-    const statuses = [];
-    for (const id of ids) {
-      const invAfter = await pay.getInvoice(id);
-      statuses.push(STATUS[Number(invAfter.status)]);
+    // invoice statuses back from the contract. One paid invoice is
+    // never reported as two, and a failed final read keeps every
+    // confirmed proof on screen instead of becoming a bare error.
+    let statuses;
+    try {
+      statuses = await readStatusesWith(pay, ids);
+    } catch (readErr) {
+      setStatus("guidePayStatus", "Payments are confirmed above with their transaction hashes. The final status reload failed (" + friendlyError(readErr) + "), so both proofs stay on screen from their receipts. Use a Reload status button below to read an invoice again.", "ok");
+      log("Guided final status reload failed after confirmation: " + friendlyError(readErr));
+      try { await refreshBalances(); } catch (e) { /* best effort */ }
+      try { await refreshList(); } catch (e) { /* best effort */ }
+      return;
     }
-    if (ids.length === 2 && statuses.every((s) => s === "Paid")) {
-      setStatus("guidePayStatus", "Both installments paid. Each milestone settled exactly once and stays locked. Proof for the last payment is below.", "ok");
+    if (guideOutcome(ids, statuses).bothPaid) {
+      setStatus("guidePayStatus", "Both installments paid. Each milestone settled exactly once and stays locked. Proofs are below.", "ok");
     } else {
-      setStatus("guidePayStatus", "Payment step finished for invoice " + ids.join(", ") + ". On chain status now reads: " + statuses.join(", ") + ". Both installments count as paid only when both read Paid, so run step C and this step again if one is still open.", "wait");
+      setStatus("guidePayStatus", "Payment step finished for invoice " + ids.join(", ") + ". On chain status now reads: " + statuses.join(", ") + ". Both installments count as paid only when both read Paid.", "wait");
     }
-    await refreshBalances();
-    await refreshList();
+    try { await refreshBalances(); } catch (e) { /* best effort */ }
+    try { await refreshList(); } catch (e) { /* best effort */ }
   } catch (e) {
     setStatus("guidePayStatus", friendlyError(e), "bad");
     log("Guided pay failed: " + friendlyError(e));
@@ -771,12 +1014,36 @@ $("loadMine").onclick = async () => {
   }
 };
 
+$("lookupMine").onclick = async () => {
+  try {
+    await lookupInvoiceById();
+  } catch (e) {
+    setStatus("mineStatus", friendlyError(e), "bad");
+    log("Invoice lookup failed: " + friendlyError(e));
+  }
+};
+
 $("refresh").onclick = refreshList;
 
 // If the user switches account or network in the wallet, reconnect the signer.
 if (window.ethereum) {
   window.ethereum.on("accountsChanged", () => location.reload());
   window.ethereum.on("chainChanged", () => location.reload());
+}
+
+// Exposed for the local logic test harness. Harmless in the browser.
+if (typeof globalThis !== "undefined") {
+  globalThis.__invoicePayDemo = {
+    locateGuideInstallmentsWith,
+    readStatusesWith,
+    guideOutcome,
+    proofFromReceipt,
+    proofHtml,
+    revertName,
+    payFlow,
+    fetchMyInvoiceIds,
+    STATUS,
+  };
 }
 </script>
 </body>

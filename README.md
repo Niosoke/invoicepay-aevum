@@ -167,6 +167,18 @@ claims, and the finance team links the two references in their
 own records while the explorer and the contract views prove
 each part on chain. Milestone names should stay distinct across
 the replacement so no milestone is billed under both references.
+One more condition matters at the switch: the old approval can
+still accept new invoices for as long as it remains valid,
+because the contract counts the cap per purchase order reference
+and the old reference keeps its own remaining balance. Approving
+a replacement does not close the old approval, and the payer has
+no way to revoke an approval that is already in use. So when
+finance moves to a replacement reference, the old approval must
+be allowed to expire, and any invoice still open under it should
+be settled or cancelled by the merchant first. Until the old
+approval expires, the merchant could still bill against either
+reference, and the two caps would add up rather than share one
+total.
 
 ## Architecture
 
@@ -218,8 +230,16 @@ check that bills two equal installments and watches the contract
 reject a resubmitted milestone, and a payer view that lists
 invoices addressed to you, verifies each one and its milestone
 claim against your approval, pays it, and produces a settlement
-proof you can copy for your records. Error messages are plain
-language throughout.
+proof you can copy for your records. The payer list is found
+through InvoiceCreated events filtered by the payer address, with
+a bounded recent scan as fallback and a direct lookup by invoice
+id. The guided payment step can resume after a reload: it finds
+both installment invoices again, pays only the one still open,
+and reads both statuses back before reporting the outcome. A
+confirmed payment shows its transaction hash and proof from the
+receipt first, and the proof stays on screen with a reload action
+if a later status read fails. Error messages are plain language
+throughout.
 
 demo/runcycle.sh runs the same full cycle from the command line
 with cast, including a resubmitted milestone attempt that must
@@ -400,7 +420,11 @@ the first invoice reserves or settles value, the merchant, cap,
 and expiry under that reference are locked. A revision uses a
 replacement reference approved for the remaining balance, with
 the two references linked in the finance records as described
-under How it works.
+under How it works. The old approval stays able to accept new
+invoices until it expires, because caps are counted per purchase
+order reference, so finance must let the old approval expire and
+have open invoices under it settled or cancelled by the merchant
+when switching to the replacement reference.
 
 Milestone references are agreed off chain. The contract enforces
 that a milestone is billed at most once per purchase order, but
