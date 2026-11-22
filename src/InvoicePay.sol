@@ -24,10 +24,20 @@ interface IERC20 {
 ///      fully settled the purchase order is locked forever, so one
 ///      approved purchase order can never be settled beyond its approved
 ///      total. Cancelling an unpaid invoice releases its reservation.
-///      The named payer settles each invoice in full; the contract pulls
-///      the tokens straight to the merchant with `transferFrom`, marks the
-///      invoice paid and emits an event. The contract never custodies
-///      funds.
+///      Every invoice also carries its own milestone reference (a bytes32
+///      hash of the milestone or invoice number it bills). The milestone
+///      reference must be unique within its purchase order approval: a
+///      second invoice naming the same milestone reverts even while the
+///      purchase order still has budget left, and even after the first
+///      invoice was paid. That is how the payer tells a resubmitted bill
+///      for work already paid apart from a legitimate next installment
+///      that happens to carry the same amount: installments carry
+///      different milestone references, resubmissions do not. Cancelling
+///      an unpaid invoice frees its milestone reference so a corrected
+///      invoice can be issued. The named payer settles each invoice in
+///      full; the contract pulls the tokens straight to the merchant with
+///      `transferFrom`, marks the invoice paid and emits an event. The
+///      contract never custodies funds.
 contract InvoicePay {
     enum Status {
         Open,
@@ -43,6 +53,7 @@ contract InvoicePay {
         uint256 paidAt; // unix timestamp, 0 while unpaid
         string memo;
         bytes32 poRef; // hash of the purchase order this invoice settles
+        bytes32 milestoneRef; // hash of the milestone this invoice bills
         Status status;
     }
 
@@ -71,6 +82,12 @@ contract InvoicePay {
     ///      different payers is two independent purchase orders.
     mapping(bytes32 => PurchaseOrder) private _purchaseOrders;
 
+    /// @dev The invoice that currently claims a milestone, keyed by payer,
+    ///      poRef and milestoneRef. Stores invoiceId + 1 so that 0 means
+    ///      the milestone is free. Set at creation, kept after payment (a
+    ///      paid milestone stays locked forever), cleared on cancel.
+    mapping(bytes32 => uint256) private _milestoneInvoice;
+
     uint256 private _lock = 1;
 
     event PurchaseOrderApproved(
@@ -83,7 +100,8 @@ contract InvoicePay {
         uint256 amount,
         uint256 dueDate,
         string memo,
-        bytes32 poRef
+        bytes32 poRef,
+        bytes32 milestoneRef
     );
     event InvoicePaid(uint256 indexed invoiceId, address indexed payer, address indexed merchant, uint256 amount, uint256 paidAt);
     event InvoiceCancelled(uint256 indexed invoiceId, address indexed merchant);
@@ -105,6 +123,8 @@ contract InvoicePay {
     error WrongMerchant();
     error PurchaseOrderExpired();
     error AmountExceedsApproval();
+    error ZeroMilestone();
+    error DuplicateMilestone();
 
     modifier nonReentrant() {
         if (_lock != 1) revert ReentrantCall();
@@ -156,9 +176,10 @@ contract InvoicePay {
     ///         approved. The caller becomes the merchant and must be the
     ///         merchant named in the approval. Reverts when there is no
     ///         approval, the approval names another merchant, the approval
-    ///         has expired, the purchase order is already fully settled, or
-    ///         the amount would push the settled plus reserved total past
-    ///         the approved cap.
+    ///         has expired, the purchase order is already fully settled,
+    ///         the milestone reference is already claimed by another
+    ///         invoice under this approval, or the amount would push the
+    ///         settled plus reserved total past the approved cap.
     /// @param payer The only address allowed to settle this invoice. Must
     ///        have approved this purchase order for the caller.
     /// @param amount Amount in token base units (e.g. 25_000000 = 25 tUSD8).
@@ -167,26 +188,39 @@ contract InvoicePay {
     /// @param poRef Hash of the purchase order being settled, e.g.
     ///        keccak256("PO 1042"). Must be non-zero and approved by the
     ///        payer for the caller.
+    /// @param milestoneRef Hash of the milestone this invoice bills, e.g.
+    ///        keccak256("PO 1042 milestone 1"). Must be non-zero and
+    ///        unique within the purchase order approval: a resubmitted
+    ///        bill for the same milestone reverts even while budget
+    ///        remains, while a different milestone with the same amount
+    ///        is fine.
     /// @return invoiceId Id of the new invoice.
-    function createInvoice(address payer, uint256 amount, uint256 dueDate, string calldata memo, bytes32 poRef)
-        external
-        returns (uint256 invoiceId)
-    {
+    function createInvoice(
+        address payer,
+        uint256 amount,
+        uint256 dueDate,
+        string calldata memo,
+        bytes32 poRef,
+        bytes32 milestoneRef
+    ) external returns (uint256 invoiceId) {
         if (payer == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (dueDate <= block.timestamp) revert DueDateInPast();
         if (poRef == bytes32(0)) revert ZeroPurchaseOrder();
+        if (milestoneRef == bytes32(0)) revert ZeroMilestone();
 
         PurchaseOrder storage po = _purchaseOrders[_poKey(payer, poRef)];
         if (!po.exists) revert PurchaseOrderNotApproved();
         if (po.merchant != msg.sender) revert WrongMerchant();
         if (block.timestamp > po.expiry) revert PurchaseOrderExpired();
         if (po.settled == po.amount) revert DuplicatePurchaseOrder();
+        if (_milestoneInvoice[_milestoneKey(payer, poRef, milestoneRef)] != 0) revert DuplicateMilestone();
         if (amount > po.amount - po.settled - po.live) revert AmountExceedsApproval();
 
         po.live += amount;
 
         invoiceId = invoices.length;
+        _milestoneInvoice[_milestoneKey(payer, poRef, milestoneRef)] = invoiceId + 1;
         invoices.push(
             Invoice({
                 merchant: msg.sender,
@@ -196,18 +230,21 @@ contract InvoicePay {
                 paidAt: 0,
                 memo: memo,
                 poRef: poRef,
+                milestoneRef: milestoneRef,
                 status: Status.Open
             })
         );
 
-        emit InvoiceCreated(invoiceId, msg.sender, payer, amount, dueDate, memo, poRef);
+        emit InvoiceCreated(invoiceId, msg.sender, payer, amount, dueDate, memo, poRef, milestoneRef);
     }
 
     /// @notice Settle an invoice in full. The payer must first approve this
     ///         contract to spend at least the invoice amount of tUSD8.
     ///         Funds go directly to the merchant; nothing is custodied here.
     ///         The payment moves the invoice amount from the reserved total
-    ///         to the settled total of its purchase order.
+    ///         to the settled total of its purchase order. The milestone
+    ///         stays claimed after payment, so the same milestone can
+    ///         never be billed again.
     function payInvoice(uint256 invoiceId) external nonReentrant {
         if (invoiceId >= invoices.length) revert InvoiceNotFound();
         Invoice storage inv = invoices[invoiceId];
@@ -230,7 +267,8 @@ contract InvoicePay {
 
     /// @notice Cancel an unpaid invoice. Only the merchant can cancel.
     ///         Cancelling releases the amount the invoice reserved against
-    ///         its purchase order, so a corrected invoice can be created.
+    ///         its purchase order and frees its milestone reference, so a
+    ///         corrected invoice can be created.
     function cancelInvoice(uint256 invoiceId) external {
         if (invoiceId >= invoices.length) revert InvoiceNotFound();
         Invoice storage inv = invoices[invoiceId];
@@ -239,6 +277,7 @@ contract InvoicePay {
 
         inv.status = Status.Cancelled;
         _purchaseOrders[_poKey(inv.payer, inv.poRef)].live -= inv.amount;
+        _milestoneInvoice[_milestoneKey(inv.payer, inv.poRef, inv.milestoneRef)] = 0;
         emit InvoiceCancelled(invoiceId, msg.sender);
     }
 
@@ -276,7 +315,28 @@ contract InvoicePay {
         return po.amount - po.settled - po.live;
     }
 
+    /// @notice Whether a milestone reference is claimed under a purchase
+    ///         order approval, and by which invoice. `used` is false when
+    ///         the milestone is free (never billed, or its invoice was
+    ///         cancelled). When used, `invoiceId` and `status` describe
+    ///         the claiming invoice: Open while unpaid, Paid once settled
+    ///         (a paid milestone stays claimed forever).
+    function milestoneStatus(address payer, bytes32 poRef, bytes32 milestoneRef)
+        external
+        view
+        returns (bool used, uint256 invoiceId, Status status)
+    {
+        uint256 stored = _milestoneInvoice[_milestoneKey(payer, poRef, milestoneRef)];
+        if (stored == 0) return (false, 0, Status.Open);
+        invoiceId = stored - 1;
+        return (true, invoiceId, invoices[invoiceId].status);
+    }
+
     function _poKey(address payer, bytes32 poRef) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(payer, poRef));
+    }
+
+    function _milestoneKey(address payer, bytes32 poRef, bytes32 milestoneRef) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(payer, poRef, milestoneRef));
     }
 }

@@ -52,16 +52,16 @@
 <body>
 <main>
   <h1>InvoicePay</h1>
-  <p class="sub">Stablecoin invoices on the QDay Aevum testnet (chain 44005). The payer first approves a purchase order on chain: which merchant may bill it, the total cap, and an expiry. The merchant then creates invoices against that approval, in full or in parts, and the contract rejects anything beyond the approved total. The named payer settles each invoice on chain and the contract marks it paid. The contract never holds funds: payment goes straight from payer to merchant.</p>
+  <p class="sub">Stablecoin invoices on the QDay Aevum testnet (chain 44005). The payer first approves a purchase order on chain: which merchant may bill it, the total cap, and an expiry. The merchant then creates invoices against that approval, in full or in parts, and the contract rejects anything beyond the approved total. Every invoice also names the milestone it bills, and a milestone can only be billed once per purchase order: a resubmitted bill for work already paid is rejected even while budget remains, while the next installment with the same amount goes through. The named payer settles each invoice on chain and the contract marks it paid. The contract never holds funds: payment goes straight from payer to merchant.</p>
 
   <section>
     <h2>How this demo works</h2>
     <ol class="steps">
       <li>Connect a wallet. The demo adds the QDay Aevum testnet for you.</li>
       <li>As the payer, approve a purchase order: name the merchant, the total cap, and an expiry.</li>
-      <li>As the merchant (switch account in your wallet), create an invoice against that purchase order.</li>
-      <li>Try the guided check below: approve, create, watch an over the cap invoice get rejected, then pay.</li>
-      <li>As the payer, open your invoice view, verify each invoice against your approval, pay, and copy the settlement proof for your records.</li>
+      <li>As the merchant (switch account in your wallet), create an invoice against that purchase order and name the milestone it bills.</li>
+      <li>Try the guided check below: approve, bill two equal installments, watch a resubmitted milestone get rejected, then pay both.</li>
+      <li>As the payer, open your invoice view, verify each invoice and its milestone against your approval, pay, and copy the settlement proof for your records.</li>
     </ol>
     <p class="hint">You need testnet tQDAY for gas and tUSD8 to pay with. Both come free from the faucet at <a href="https://faucet.qday.info" target="_blank" rel="noopener">faucet.qday.info</a>. This is a testnet: nothing here has real value.</p>
   </section>
@@ -72,7 +72,7 @@
     <div class="row">
       <div>
         <label>InvoicePay contract</label>
-        <input id="contract" value="0xbBbB9BDcbE16B548C5d452a74F2C67EcD66bA363" />
+        <input id="contract" value="0x7159f69bc4c03598ba74e35b24bf828430310d8d" />
       </div>
       <div>
         <label>tUSD8 token</label>
@@ -103,18 +103,20 @@
 
   <section>
     <h2>3. Merchant: create an invoice</h2>
-    <p class="hint">You are the merchant. The payer must have approved this purchase order for your address first (step 2). Name the payer, the amount, a due date, a memo, and the purchase order this invoice settles. The amount can be part of the approved total, for example one delivery of several. The contract rejects the invoice if there is no approval, if the approval names another merchant, if it has expired, or if the amount would push the total past the approved cap.</p>
+    <p class="hint">You are the merchant. The payer must have approved this purchase order for your address first (step 2). Name the payer, the amount, a due date, a memo, the purchase order this invoice settles, and the milestone it bills. The amount can be part of the approved total, for example one delivery of several. The milestone names the piece of work being billed, for example "PO 3001 milestone 1": each milestone can be billed only once per purchase order, so a resubmitted bill is rejected while the next installment goes through. The contract rejects the invoice if there is no approval, if the approval names another merchant, if it has expired, if the milestone was already billed, or if the amount would push the total past the approved cap.</p>
     <div class="row">
       <div><label>Payer address</label><input id="payer" placeholder="0x..." /></div>
       <div><label>Amount (tUSD8)</label><input id="amount" type="number" step="0.000001" min="0" value="0.5" /></div>
     </div>
     <div class="row">
       <div><label>Purchase order reference</label><input id="poRef" value="PO 3001" /></div>
-      <div><label>Due in (days)</label><input id="days" type="number" min="1" value="7" /></div>
+      <div><label>Milestone reference</label><input id="milestoneRef" value="PO 3001 milestone 1" /></div>
     </div>
     <div class="row">
+      <div><label>Due in (days)</label><input id="days" type="number" min="1" value="7" /></div>
       <div><label>Memo</label><input id="memo" value="Invoice for PO 3001, first half" /></div>
     </div>
+    <p class="small" id="milestoneHashNote"></p>
     <button id="create" disabled>Create invoice</button>
     <button id="cancel" disabled class="ghost">Cancel invoice by id (merchant only)</button>
     <div class="row">
@@ -124,8 +126,8 @@
   </section>
 
   <section>
-    <h2>Guided check: approved once, settled up to the cap, never beyond</h2>
-    <p class="hint">This walks through the core promise of InvoicePay in four steps. It uses its own purchase order reference below. Use a fresh purchase order text (for example PO 4001) so it does not collide with an approval you already made. Steps A and D run as the payer, steps B and C as the merchant, so switch accounts in your wallet between steps.</p>
+    <h2>Guided check: two equal installments settle, a resubmitted milestone is rejected</h2>
+    <p class="hint">This walks through the milestone promise of InvoicePay in five steps. It uses its own purchase order reference below. Use a fresh purchase order text (for example PO 4001) so it does not collide with an approval you already made. Steps A and E run as the payer, steps B, C and D as the merchant, so switch accounts in your wallet between steps. The two installments carry the identical amount on purpose: what tells them apart is the milestone each one names.</p>
     <div class="row">
       <div><label>Merchant address</label><input id="guideMerchant" placeholder="0x..." /></div>
       <div><label>Payer address</label><input id="guidePayer" placeholder="0x..." /></div>
@@ -134,24 +136,32 @@
       <div><label>Purchase order reference for the check</label><input id="guidePo" value="PO 4001" /></div>
       <div><label>Approved total (tUSD8)</label><input id="guideAmount" type="number" step="0.000001" min="0" value="1" /></div>
     </div>
+    <div class="row">
+      <div><label>Each installment (tUSD8)</label><input id="guideInstallment" type="number" step="0.000001" min="0" value="0.4" /></div>
+    </div>
     <div class="guide-step">
       <p class="hint"><strong>Step A.</strong> As the payer, approve this purchase order for the merchant above, capped at the approved total.</p>
       <button id="guideApprove" disabled>Approve the purchase order</button>
       <p class="status" id="guideApproveStatus"></p>
     </div>
     <div class="guide-step">
-      <p class="hint"><strong>Step B.</strong> Switch to the merchant account. Create an invoice for the full approved total against this purchase order.</p>
-      <button id="guideCreate" disabled>Create the invoice</button>
+      <p class="hint"><strong>Step B.</strong> Switch to the merchant account. Create the first installment invoice, naming milestone 1 of this purchase order.</p>
+      <button id="guideCreate" disabled>Create installment 1 (milestone 1)</button>
       <p class="status" id="guideCreateStatus"></p>
     </div>
     <div class="guide-step">
-      <p class="hint"><strong>Step C.</strong> Still as the merchant, try to create another invoice against the same purchase order. The approved total is already fully reserved, so the contract must reject it. A rejection here is the demo working as intended.</p>
-      <button id="guideDuplicate" disabled>Try to bill beyond the cap (must be rejected)</button>
+      <p class="hint"><strong>Step C.</strong> Still as the merchant, create the second installment for the same amount, naming milestone 2. Same amount, different milestone: this one is legitimate and must be accepted.</p>
+      <button id="guideCreate2" disabled>Create installment 2 (milestone 2, same amount)</button>
+      <p class="status" id="guideCreate2Status"></p>
+    </div>
+    <div class="guide-step">
+      <p class="hint"><strong>Step D.</strong> Still as the merchant, try to bill milestone 1 again for the same amount. Budget still remains under the cap, but the milestone is already claimed, so the contract must reject it. A rejection here is the demo working as intended.</p>
+      <button id="guideDuplicate" disabled>Resubmit milestone 1 (must be rejected)</button>
       <p class="status" id="guideDuplicateStatus"></p>
     </div>
     <div class="guide-step">
-      <p class="hint"><strong>Step D.</strong> Switch back to the payer account and pay the original invoice. It settles exactly once, and the purchase order stays locked afterwards.</p>
-      <button id="guidePay" disabled>Pay the original invoice</button>
+      <p class="hint"><strong>Step E.</strong> Switch back to the payer account and pay both installments. Each settles exactly once, and both milestones stay locked afterwards.</p>
+      <button id="guidePay" disabled>Pay both installments</button>
       <p class="status" id="guidePayStatus"></p>
       <div id="guideProof"></div>
     </div>
@@ -159,7 +169,7 @@
 
   <section>
     <h2>4. Payer: invoices addressed to you</h2>
-    <p class="hint">Switch to the payer account, then load your invoices. For each one the demo reads your purchase order approval from the contract so you can verify the merchant, the amount, and how much of the approved total is already settled before you pay. After payment you get a settlement proof you can copy into your records.</p>
+    <p class="hint">Switch to the payer account, then load your invoices. For each one the demo reads your purchase order approval and the milestone claim from the contract so you can verify the merchant, the amount, the milestone it bills, and how much of the approved total is already settled before you pay. After payment you get a settlement proof you can copy into your records.</p>
     <button id="loadMine" disabled class="secondary">Load my invoices</button>
     <p class="status" id="mineStatus"></p>
     <div id="mineWrap"></div>
@@ -168,7 +178,7 @@
 
   <section>
     <h2>5. Invoices on chain</h2>
-    <p class="hint">Read live from the contract. Refresh after creating or paying an invoice. The PO column shows the short form of the purchase order hash bound to each invoice.</p>
+    <p class="hint">Read live from the contract. Refresh after creating or paying an invoice. The PO column shows the short form of the purchase order hash bound to each invoice, and the Milestone column shows the short form of the milestone hash it bills.</p>
     <button id="refresh" disabled class="secondary">Refresh invoice list</button>
     <p class="status" id="listStatus"></p>
     <div id="listWrap"></div>
@@ -192,16 +202,17 @@ const AEVUM = {
 const EXPLORER = "https://explorer-test.qday.info";
 const PAY_ABI = [
   "function approvePurchaseOrder(address merchant, bytes32 poRef, uint256 amount, uint256 expiry)",
-  "function createInvoice(address payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef) returns (uint256)",
+  "function createInvoice(address payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef, bytes32 milestoneRef) returns (uint256)",
   "function payInvoice(uint256 invoiceId)",
   "function cancelInvoice(uint256 invoiceId)",
-  "function getInvoice(uint256 invoiceId) view returns (tuple(address merchant, address payer, uint256 amount, uint256 dueDate, uint256 paidAt, string memo, bytes32 poRef, uint8 status))",
+  "function getInvoice(uint256 invoiceId) view returns (tuple(address merchant, address payer, uint256 amount, uint256 dueDate, uint256 paidAt, string memo, bytes32 poRef, bytes32 milestoneRef, uint8 status))",
   "function getPurchaseOrder(address payer, bytes32 poRef) view returns (tuple(address merchant, uint256 amount, uint256 expiry, uint256 settled, uint256 live, bool exists))",
   "function purchaseOrderRemaining(address payer, bytes32 poRef) view returns (uint256)",
+  "function milestoneStatus(address payer, bytes32 poRef, bytes32 milestoneRef) view returns (bool used, uint256 invoiceId, uint8 status)",
   "function isOverdue(uint256 invoiceId) view returns (bool)",
   "function invoiceCount() view returns (uint256)",
   "event PurchaseOrderApproved(address indexed payer, address indexed merchant, bytes32 indexed poRef, uint256 amount, uint256 expiry)",
-  "event InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef)",
+  "event InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount, uint256 dueDate, string memo, bytes32 poRef, bytes32 milestoneRef)",
   "event InvoicePaid(uint256 indexed invoiceId, address indexed payer, address indexed merchant, uint256 amount, uint256 paidAt)",
   "event InvoiceCancelled(uint256 indexed invoiceId, address indexed merchant)",
   "error ZeroAddress()",
@@ -221,6 +232,8 @@ const PAY_ABI = [
   "error WrongMerchant()",
   "error PurchaseOrderExpired()",
   "error AmountExceedsApproval()",
+  "error ZeroMilestone()",
+  "error DuplicateMilestone()",
 ];
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
@@ -262,6 +275,14 @@ function updatePoNote() {
 }
 $("poText").addEventListener("input", updatePoNote);
 updatePoNote();
+function updateMilestoneNote() {
+  const text = $("milestoneRef").value.trim();
+  $("milestoneHashNote").textContent = text
+    ? "On chain this milestone is stored as the hash " + poHash(text) + ". It can be billed only once under its purchase order."
+    : "Enter a milestone reference. It is hashed before it goes on chain.";
+}
+$("milestoneRef").addEventListener("input", updateMilestoneNote);
+updateMilestoneNote();
 
 // Turn wallet and contract errors into plain language.
 function friendlyError(e) {
@@ -275,6 +296,8 @@ function friendlyError(e) {
   if (lower.includes("duplicatepurchaseorder")) return "Rejected: this purchase order is already fully settled. It can never be billed again.";
   if (lower.includes("purchaseorderalreadyapproved")) return "Rejected: this purchase order is already in use, so its terms are locked. Approving again is only possible before any invoice reserves against it.";
   if (lower.includes("zeropurchaseorder")) return "Enter a purchase order reference. Every invoice must name the purchase order it settles.";
+  if (lower.includes("duplicatemilestone")) return "Rejected: this milestone was already billed under this purchase order. Each milestone can be billed only once, so a resubmitted bill is refused even while budget remains. Use the next milestone reference for the next installment.";
+  if (lower.includes("zeromilestone")) return "Enter a milestone reference. Every invoice must name the milestone it bills.";
   if (lower.includes("notpayer")) return "This wallet is not the payer named on the invoice. Switch to the payer account and try again.";
   if (lower.includes("notmerchant")) return "Only the merchant who created this invoice can cancel it.";
   if (lower.includes("invoicenotopen")) return "This invoice is not open any more. It was already paid or cancelled.";
@@ -292,7 +315,7 @@ function friendlyError(e) {
 }
 
 let signer, pay, token, myAddr;
-let guideInvoiceId = null;
+let guideInvoiceIds = [];
 
 async function refreshBalances() {
   if (!signer) return;
@@ -350,14 +373,14 @@ async function refreshList() {
       setStatus("listStatus", "The contract holds 0 invoices.", "");
       return;
     }
-    let html = "<table><thead><tr><th>Id</th><th>Memo</th><th>PO</th><th>Amount</th><th>Merchant</th><th>Payer</th><th>Due</th><th>Status</th></tr></thead><tbody>";
+    let html = "<table><thead><tr><th>Id</th><th>Memo</th><th>PO</th><th>Milestone</th><th>Amount</th><th>Merchant</th><th>Payer</th><th>Due</th><th>Status</th></tr></thead><tbody>";
     for (let i = 0; i < count; i++) {
       const inv = await pay.getInvoice(i);
       const status = STATUS[Number(inv.status)];
       let badge = '<span class="badge ' + status.toLowerCase() + '">' + status + "</span>";
       if (status === "Open" && (await pay.isOverdue(i))) badge += ' <span class="badge overdue">Overdue</span>';
       const paidNote = Number(inv.paidAt) > 0 ? '<div class="small">paid ' + fmtDate(inv.paidAt) + "</div>" : "";
-      html += "<tr><td>" + i + "</td><td>" + escapeHtml(inv.memo) + "</td><td class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</td><td>" +
+      html += "<tr><td>" + i + "</td><td>" + escapeHtml(inv.memo) + "</td><td class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</td><td class=\"mono\" title=\"" + inv.milestoneRef + "\">" + shortHash(inv.milestoneRef) + "</td><td>" +
         fmtAmt(inv.amount) + " tUSD8</td><td class=\"mono\">" + shortAddr(inv.merchant) +
         "</td><td class=\"mono\">" + shortAddr(inv.payer) + "</td><td>" + fmtDate(inv.dueDate) +
         "</td><td>" + badge + paidNote + "</td></tr>";
@@ -373,22 +396,23 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-async function createInvoiceFlow(payer, amountText, poText, memo, days, statusId) {
+async function createInvoiceFlow(payer, amountText, poText, milestoneText, memo, days, statusId) {
   const amount = ethers.parseUnits(amountText, 6);
   if (amount === 0n) throw new Error("The amount must be more than zero.");
   if (!poText) throw new Error("Enter a purchase order reference. Every invoice must name the purchase order it settles.");
+  if (!milestoneText) throw new Error("Enter a milestone reference. Every invoice must name the milestone it bills.");
   if (!days || days < 1) throw new Error("Due in days must be at least 1.");
   const due = Math.floor(Date.now() / 1000) + days * 86400;
   setStatus(statusId, "Waiting for your wallet confirmation...", "wait");
-  const tx = await pay.createInvoice(payer, amount, due, memo, poHash(poText));
+  const tx = await pay.createInvoice(payer, amount, due, memo, poHash(poText), poHash(milestoneText));
   setStatus(statusId, "Invoice transaction sent, waiting for confirmation: " + txLink(tx.hash), "wait");
   log("createInvoice sent: " + tx.hash);
   const receipt = await tx.wait();
   const ev = receipt.logs.map((l) => { try { return pay.interface.parseLog(l); } catch { return null; } })
     .find((p) => p && p.name === "InvoiceCreated");
   if (ev) {
-    setStatus(statusId, "Invoice " + ev.args.invoiceId + " created for " + amountText + " tUSD8 against purchase order \"" + escapeHtml(poText) + "\". Tx: " + txLink(tx.hash), "ok");
-    log("Invoice created, id " + ev.args.invoiceId + ", purchase order hash " + poHash(poText) + ".");
+    setStatus(statusId, "Invoice " + ev.args.invoiceId + " created for " + amountText + " tUSD8 against purchase order \"" + escapeHtml(poText) + "\", milestone \"" + escapeHtml(milestoneText) + "\". Tx: " + txLink(tx.hash), "ok");
+    log("Invoice created, id " + ev.args.invoiceId + ", purchase order hash " + poHash(poText) + ", milestone hash " + poHash(milestoneText) + ".");
     return ev.args.invoiceId;
   }
   setStatus(statusId, "Transaction confirmed: " + txLink(tx.hash), "ok");
@@ -426,6 +450,7 @@ async function payFlow(id, statusId) {
   return {
     invoiceId: id,
     poRef: inv.poRef,
+    milestoneRef: inv.milestoneRef,
     merchant: inv.merchant,
     payer: inv.payer,
     amountText,
@@ -440,6 +465,7 @@ function proofHtml(p) {
     "InvoicePay settlement proof\n" +
     "Invoice id: " + p.invoiceId + "\n" +
     "Purchase order hash: " + p.poRef + "\n" +
+    "Milestone hash: " + p.milestoneRef + "\n" +
     "Merchant: " + p.merchant + "\n" +
     "Payer: " + p.payer + "\n" +
     "Amount: " + p.amountText + " tUSD8\n" +
@@ -495,14 +521,20 @@ async function loadMyInvoices() {
         ", reserved by open invoices " + fmtAmt(po.live) + ", still available " + fmtAmt(po.amount - po.settled - po.live) +
         ", approval expiry " + fmtDate(po.expiry) + ".";
     }
+    const ms = await pay.milestoneStatus(myAddr, inv.poRef, inv.milestoneRef);
+    const msCheck = ms.used
+      ? "This milestone is claimed by invoice " + ms.invoiceId + " (status " + STATUS[Number(ms.status)] + "), so it cannot be billed again under this purchase order."
+      : "This milestone is not claimed under your approval. That should not happen for an invoice created by the contract; do not pay until you recognise it.";
     html += '<div class="card"><h3>Invoice ' + i + " " + badge + '</h3><p class="kv">' +
       "<b>Memo:</b> " + escapeHtml(inv.memo) + "<br>" +
       "<b>Purchase order hash:</b> <span class=\"mono\" title=\"" + inv.poRef + "\">" + shortHash(inv.poRef) + "</span><br>" +
+      "<b>Milestone hash:</b> <span class=\"mono\" title=\"" + inv.milestoneRef + "\">" + shortHash(inv.milestoneRef) + "</span><br>" +
       "<b>Merchant:</b> <span class=\"mono\">" + inv.merchant + "</span><br>" +
       "<b>Amount:</b> " + fmtAmt(inv.amount) + " tUSD8<br>" +
       "<b>Due:</b> " + fmtDate(inv.dueDate) + "<br>" +
       (Number(inv.paidAt) > 0 ? "<b>Paid at:</b> " + fmtDate(inv.paidAt) + "<br>" : "") +
-      "<b>Your approval check:</b> " + verify + "</p>" +
+      "<b>Your approval check:</b> " + verify + "<br>" +
+      "<b>Milestone check:</b> " + msCheck + "</p>" +
       (status === "Open" ? '<button data-pay="' + i + '">Approve and pay invoice ' + i + "</button>" : "") +
       '<p class="status" id="minePayStatus' + i + '"></p></div>';
   }
@@ -543,7 +575,7 @@ $("connect").onclick = async () => {
     if (!ethers.isAddress(tokenAddr)) throw new Error("The tUSD8 token address above is not a valid address.");
     pay = new ethers.Contract(contractAddr, PAY_ABI, signer);
     token = new ethers.Contract(tokenAddr, ERC20_ABI, signer);
-    ["approvePo", "checkPo", "create", "cancel", "refresh", "loadMine", "guideApprove", "guideCreate", "guideDuplicate", "guidePay"].forEach((id) => ($(id).disabled = false));
+    ["approvePo", "checkPo", "create", "cancel", "refresh", "loadMine", "guideApprove", "guideCreate", "guideCreate2", "guideDuplicate", "guidePay"].forEach((id) => ($(id).disabled = false));
     log("Connected as " + myAddr + " on QDay Aevum testnet.");
     await refreshBalances();
     await refreshList();
@@ -576,7 +608,7 @@ $("create").onclick = async () => {
   try {
     const payer = $("payer").value.trim();
     if (!ethers.isAddress(payer)) throw new Error("Enter the payer wallet address (it starts with 0x).");
-    await createInvoiceFlow(payer, $("amount").value, $("poRef").value.trim(), $("memo").value, Number($("days").value), "createStatus");
+    await createInvoiceFlow(payer, $("amount").value, $("poRef").value.trim(), $("milestoneRef").value.trim(), $("memo").value, Number($("days").value), "createStatus");
     await refreshList();
   } catch (e) {
     setStatus("createStatus", friendlyError(e), "bad");
@@ -620,7 +652,8 @@ $("guideCreate").onclick = async () => {
     const poText = $("guidePo").value.trim();
     const po = await pay.getPurchaseOrder(payer, poHash(poText));
     if (!po.exists) throw new Error("The payer has not approved purchase order \"" + poText + "\" yet. Run step A as the payer first.");
-    guideInvoiceId = await createInvoiceFlow(payer, $("guideAmount").value, poText, "Guided check invoice for " + poText, 7, "guideCreateStatus");
+    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 1", "Guided check installment 1 for " + poText, 7, "guideCreateStatus");
+    if (id !== null) guideInvoiceIds[0] = id;
     await refreshList();
   } catch (e) {
     setStatus("guideCreateStatus", friendlyError(e), "bad");
@@ -628,49 +661,72 @@ $("guideCreate").onclick = async () => {
   }
 };
 
+$("guideCreate2").onclick = async () => {
+  try {
+    const merchant = $("guideMerchant").value.trim();
+    const payer = $("guidePayer").value.trim();
+    if (!ethers.isAddress(merchant) || !ethers.isAddress(payer)) throw new Error("Enter both the merchant and payer wallet addresses for the check.");
+    if (merchant.toLowerCase() !== myAddr.toLowerCase()) throw new Error("Step C runs as the merchant. You are connected as " + shortAddr(myAddr) + " but the merchant field says " + shortAddr(merchant) + ". Switch accounts or fix the field.");
+    const poText = $("guidePo").value.trim();
+    const po = await pay.getPurchaseOrder(payer, poHash(poText));
+    if (!po.exists) throw new Error("The payer has not approved purchase order \"" + poText + "\" yet. Run step A as the payer first.");
+    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 2", "Guided check installment 2 for " + poText, 7, "guideCreate2Status");
+    if (id !== null) guideInvoiceIds[1] = id;
+    await refreshList();
+  } catch (e) {
+    setStatus("guideCreate2Status", friendlyError(e), "bad");
+    log("Guided create 2 failed: " + friendlyError(e));
+  }
+};
+
 $("guideDuplicate").onclick = async () => {
   try {
     const payer = $("guidePayer").value.trim();
     const poText = $("guidePo").value.trim();
+    const msText = poText + " milestone 1";
+    const ms = await pay.milestoneStatus(payer, poHash(poText), poHash(msText));
+    if (!ms.used) throw new Error("Milestone 1 is not claimed yet for purchase order \"" + poText + "\". Run step B first so the resubmission has something to collide with.");
     const po = await pay.getPurchaseOrder(payer, poHash(poText));
-    if (!po.exists) throw new Error("No approval found for purchase order \"" + poText + "\". Run step A first.");
     const remaining = po.amount - po.settled - po.live;
-    if (remaining > 0n) throw new Error("The approved total still has " + fmtAmt(remaining) + " tUSD8 available, so another invoice would be accepted. Run step B first so the cap is fully reserved.");
-    setStatus("guideDuplicateStatus", "The approved total is fully reserved. Now trying another invoice against it. Confirm in your wallet; the contract should reject it.", "wait");
-    const amount = ethers.parseUnits($("guideAmount").value, 6);
+    setStatus("guideDuplicateStatus", "Milestone 1 is already claimed by invoice " + ms.invoiceId + " and " + fmtAmt(remaining) + " tUSD8 of budget remains. Now resubmitting milestone 1. Confirm in your wallet; the contract should reject it.", "wait");
+    const amount = ethers.parseUnits($("guideInstallment").value, 6);
     const due = Math.floor(Date.now() / 1000) + 7 * 86400;
-    const tx = await pay.createInvoice(payer, amount, due, "Beyond the cap for " + poText, poHash(poText));
+    const tx = await pay.createInvoice(payer, amount, due, "Resubmitted milestone 1 for " + poText, poHash(poText), poHash(msText));
     await tx.wait();
-    setStatus("guideDuplicateStatus", "Unexpected: the extra invoice was accepted. Tx: " + txLink(tx.hash), "bad");
-    log("Extra invoice was accepted (unexpected): " + tx.hash);
+    setStatus("guideDuplicateStatus", "Unexpected: the resubmitted milestone was accepted. Tx: " + txLink(tx.hash), "bad");
+    log("Resubmitted milestone was accepted (unexpected): " + tx.hash);
     await refreshList();
   } catch (e) {
     const msg = friendlyError(e);
     if (msg.startsWith("Rejected:")) {
       setStatus("guideDuplicateStatus", "Rejected as intended. " + msg, "ok");
-      log("Beyond the cap invoice rejected as intended.");
+      log("Resubmitted milestone rejected as intended.");
     } else {
       setStatus("guideDuplicateStatus", msg, "bad");
-      log("Duplicate attempt ended with: " + msg);
+      log("Resubmission attempt ended with: " + msg);
     }
   }
 };
 
 $("guidePay").onclick = async () => {
   try {
-    let id = guideInvoiceId;
-    if (id === null) {
+    let ids = guideInvoiceIds.filter((x) => x !== undefined && x !== null);
+    if (ids.length < 2) {
       const payer = $("guidePayer").value.trim();
       const poText = $("guidePo").value.trim();
-      const count = Number(await pay.invoiceCount());
-      for (let i = count - 1; i >= 0; i--) {
-        const inv = await pay.getInvoice(i);
-        if (inv.payer.toLowerCase() === payer.toLowerCase() && inv.poRef === poHash(poText) && STATUS[Number(inv.status)] === "Open") { id = i; break; }
+      ids = [];
+      for (const msText of [poText + " milestone 1", poText + " milestone 2"]) {
+        const ms = await pay.milestoneStatus(payer, poHash(poText), poHash(msText));
+        if (ms.used && STATUS[Number(ms.status)] === "Open") ids.push(ms.invoiceId);
       }
-      if (id === null) throw new Error("No open invoice found for purchase order \"" + poText + "\". Run steps A and B first, then switch to the payer account for this step.");
+      if (ids.length === 0) throw new Error("No open guided installments found for purchase order \"" + poText + "\". Run steps A to C first, then switch to the payer account for this step.");
     }
-    const proof = await payFlow(id, "guidePayStatus");
-    $("guideProof").innerHTML = proofHtml(proof);
+    let lastProof = null;
+    for (const id of ids) {
+      lastProof = await payFlow(id, "guidePayStatus");
+    }
+    if (lastProof) $("guideProof").innerHTML = proofHtml(lastProof);
+    setStatus("guidePayStatus", "Both installments paid. Each milestone settled exactly once and stays locked. Proof for the last payment is below.", "ok");
     await refreshBalances();
     await refreshList();
   } catch (e) {

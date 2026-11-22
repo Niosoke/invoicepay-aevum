@@ -17,6 +17,7 @@ contract InvoicePayTest is Test {
     uint256 internal dueDate;
     uint256 internal poExpiry;
     uint256 internal poCounter;
+    uint256 internal milestoneCounter;
 
     function setUp() public {
         token = new MockUSD8();
@@ -33,6 +34,14 @@ contract InvoicePayTest is Test {
         return keccak256(abi.encodePacked("PO ", poCounter));
     }
 
+    /// @dev Unique milestone reference per call, so tests that bill the
+    ///      same purchase order several times never collide on the
+    ///      milestone identity unless the test wants them to.
+    function _nextMilestone() internal returns (bytes32) {
+        milestoneCounter++;
+        return keccak256(abi.encodePacked("milestone ", milestoneCounter));
+    }
+
     /// @dev The payer approves a purchase order for the merchant.
     function _approvePo(bytes32 poRef, uint256 amount) internal {
         vm.prank(payer);
@@ -43,13 +52,18 @@ contract InvoicePayTest is Test {
         bytes32 poRef = _nextPo();
         _approvePo(poRef, AMOUNT);
         vm.prank(merchant);
-        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice 1042, design work", poRef);
+        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice 1042, design work", poRef, _nextMilestone());
     }
 
     function _createWithPo(bytes32 poRef) internal returns (uint256 id) {
         _approvePo(poRef, AMOUNT);
         vm.prank(merchant);
-        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef);
+        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef, _nextMilestone());
+    }
+
+    function _createWithPoNoApprove(bytes32 poRef) internal returns (uint256 id) {
+        vm.prank(merchant);
+        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef, _nextMilestone());
     }
 
     function _pay(uint256 id) internal {
@@ -62,7 +76,10 @@ contract InvoicePayTest is Test {
 
     function testCreateInvoice() public {
         bytes32 poRef = keccak256("PO 1042");
-        uint256 id = _createWithPo(poRef);
+        bytes32 milestoneRef = keccak256("PO 1042 milestone 1");
+        _approvePo(poRef, AMOUNT);
+        vm.prank(merchant);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef, milestoneRef);
         assertEq(id, 0);
         assertEq(pay.invoiceCount(), 1);
 
@@ -74,6 +91,7 @@ contract InvoicePayTest is Test {
         assertEq(inv.paidAt, 0);
         assertEq(inv.memo, "Invoice for purchase order");
         assertEq(inv.poRef, poRef);
+        assertEq(inv.milestoneRef, milestoneRef);
         assertTrue(inv.status == InvoicePay.Status.Open);
         assertFalse(pay.isOverdue(id));
 
@@ -90,19 +108,19 @@ contract InvoicePayTest is Test {
     function testCreateRejectsZeroPayer() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.ZeroAddress.selector);
-        pay.createInvoice(address(0), AMOUNT, dueDate, "x", _nextPo());
+        pay.createInvoice(address(0), AMOUNT, dueDate, "x", _nextPo(), _nextMilestone());
     }
 
     function testCreateRejectsZeroAmount() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.ZeroAmount.selector);
-        pay.createInvoice(payer, 0, dueDate, "x", _nextPo());
+        pay.createInvoice(payer, 0, dueDate, "x", _nextPo(), _nextMilestone());
     }
 
     function testCreateRejectsPastDueDate() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.DueDateInPast.selector);
-        pay.createInvoice(payer, AMOUNT, block.timestamp, "x", _nextPo());
+        pay.createInvoice(payer, AMOUNT, block.timestamp, "x", _nextPo(), _nextMilestone());
     }
 
     function testPayInvoiceFullCycle() public {
@@ -271,7 +289,7 @@ contract InvoicePayTest is Test {
     function testCreateRejectsZeroPurchaseOrder() public {
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.ZeroPurchaseOrder.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "x", bytes32(0));
+        pay.createInvoice(payer, AMOUNT, dueDate, "x", bytes32(0), _nextMilestone());
     }
 
     function testCreateRejectsWithoutApproval() public {
@@ -280,7 +298,7 @@ contract InvoicePayTest is Test {
         // The payer never approved this reference.
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.PurchaseOrderNotApproved.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "no approval", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "no approval", poRef, _nextMilestone());
 
         assertEq(pay.invoiceCount(), 0);
         assertFalse(pay.getPurchaseOrder(payer, poRef).exists);
@@ -295,16 +313,11 @@ contract InvoicePayTest is Test {
         // The approval names the merchant, so anyone else is rejected.
         vm.prank(otherMerchant);
         vm.expectRevert(InvoicePay.WrongMerchant.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "wrong merchant", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "wrong merchant", poRef, _nextMilestone());
 
         // The named merchant can still bill against it.
         uint256 id = _createWithPoNoApprove(poRef);
         assertEq(pay.getInvoice(id).merchant, merchant);
-    }
-
-    function _createWithPoNoApprove(bytes32 poRef) internal returns (uint256 id) {
-        vm.prank(merchant);
-        id = pay.createInvoice(payer, AMOUNT, dueDate, "Invoice for purchase order", poRef);
     }
 
     function testCreateRejectsAmountAboveApproval() public {
@@ -313,7 +326,7 @@ contract InvoicePayTest is Test {
 
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.AmountExceedsApproval.selector);
-        pay.createInvoice(payer, AMOUNT + 1, dueDate, "over the cap", poRef);
+        pay.createInvoice(payer, AMOUNT + 1, dueDate, "over the cap", poRef, _nextMilestone());
     }
 
     function testCreateRejectsExpiredApproval() public {
@@ -325,7 +338,7 @@ contract InvoicePayTest is Test {
         vm.warp(shortExpiry + 1);
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.PurchaseOrderExpired.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "too late", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "too late", poRef, _nextMilestone());
     }
 
     function testPayAfterApprovalExpiry() public {
@@ -352,7 +365,7 @@ contract InvoicePayTest is Test {
         assertEq(pay.purchaseOrderRemaining(payer, poRef), AMOUNT * 2);
 
         vm.prank(merchant);
-        uint256 id = pay.createInvoice(payer, AMOUNT * 2, dueDate, "corrected amount", poRef);
+        uint256 id = pay.createInvoice(payer, AMOUNT * 2, dueDate, "corrected amount", poRef, _nextMilestone());
         assertEq(pay.getInvoice(id).amount, AMOUNT * 2);
     }
 
@@ -384,7 +397,7 @@ contract InvoicePayTest is Test {
         // The open invoice already reserves the full approved total.
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.AmountExceedsApproval.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "second invoice, same PO", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "second invoice, same PO", poRef, _nextMilestone());
 
         assertEq(pay.invoiceCount(), 1);
     }
@@ -397,7 +410,7 @@ contract InvoicePayTest is Test {
         // A fully settled purchase order can never be invoiced again.
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.DuplicatePurchaseOrder.selector);
-        pay.createInvoice(payer, AMOUNT, dueDate, "again", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "again", poRef, _nextMilestone());
     }
 
     function testPartialInvoicesUpToTotal() public {
@@ -407,9 +420,9 @@ contract InvoicePayTest is Test {
         // Two invoices of half the approved total each, like staged
         // deliveries against one purchase order.
         vm.prank(merchant);
-        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "first delivery", poRef);
+        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "first delivery", poRef, _nextMilestone());
         vm.prank(merchant);
-        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "second delivery", poRef);
+        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "second delivery", poRef, _nextMilestone());
 
         _pay(a);
         _pay(b);
@@ -422,7 +435,7 @@ contract InvoicePayTest is Test {
         // The cap is now fully settled, so nothing more can be billed.
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.DuplicatePurchaseOrder.selector);
-        pay.createInvoice(payer, 1, dueDate, "one unit more", poRef);
+        pay.createInvoice(payer, 1, dueDate, "one unit more", poRef, _nextMilestone());
     }
 
     function testPartialOverrunReverts() public {
@@ -430,16 +443,16 @@ contract InvoicePayTest is Test {
         _approvePo(poRef, AMOUNT * 2);
 
         vm.prank(merchant);
-        pay.createInvoice(payer, AMOUNT, dueDate, "first part", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "first part", poRef, _nextMilestone());
 
         // AMOUNT + 1 would push the reserved total past the cap.
         vm.prank(merchant);
         vm.expectRevert(InvoicePay.AmountExceedsApproval.selector);
-        pay.createInvoice(payer, AMOUNT + 1, dueDate, "too much", poRef);
+        pay.createInvoice(payer, AMOUNT + 1, dueDate, "too much", poRef, _nextMilestone());
 
         // Exactly the remaining headroom is fine.
         vm.prank(merchant);
-        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "second part", poRef);
+        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "second part", poRef, _nextMilestone());
         assertEq(pay.purchaseOrderRemaining(payer, poRef), 0);
         _pay(b);
     }
@@ -464,9 +477,9 @@ contract InvoicePayTest is Test {
         _approvePo(poRef, AMOUNT * 2);
 
         vm.prank(merchant);
-        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "first part", poRef);
+        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "first part", poRef, _nextMilestone());
         vm.prank(merchant);
-        pay.createInvoice(payer, AMOUNT, dueDate, "second part", poRef);
+        pay.createInvoice(payer, AMOUNT, dueDate, "second part", poRef, _nextMilestone());
         assertEq(pay.purchaseOrderRemaining(payer, poRef), 0);
 
         // Cancelling one part frees exactly its amount again.
@@ -475,7 +488,7 @@ contract InvoicePayTest is Test {
         assertEq(pay.purchaseOrderRemaining(payer, poRef), AMOUNT);
 
         vm.prank(merchant);
-        uint256 c = pay.createInvoice(payer, AMOUNT, dueDate, "replacement part", poRef);
+        uint256 c = pay.createInvoice(payer, AMOUNT, dueDate, "replacement part", poRef, _nextMilestone());
         _pay(c);
         assertTrue(pay.getInvoice(c).status == InvoicePay.Status.Paid);
     }
@@ -509,7 +522,7 @@ contract InvoicePayTest is Test {
         vm.prank(otherPayer);
         pay.approvePurchaseOrder(otherMerchant, poRef, AMOUNT, poExpiry);
         vm.prank(otherMerchant);
-        uint256 b = pay.createInvoice(otherPayer, AMOUNT, dueDate, "other pair", poRef);
+        uint256 b = pay.createInvoice(otherPayer, AMOUNT, dueDate, "other pair", poRef, _nextMilestone());
 
         _pay(a);
         _pay(b);
@@ -539,7 +552,7 @@ contract InvoicePayTest is Test {
 
         // Create, pay, and watch settled and live move.
         vm.prank(merchant);
-        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "part", poRef);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "part", poRef, _nextMilestone());
         InvoicePay.PurchaseOrder memory live = pay.getPurchaseOrder(payer, poRef);
         assertEq(live.live, AMOUNT);
         assertEq(live.settled, 0);
@@ -550,5 +563,217 @@ contract InvoicePayTest is Test {
         assertEq(settled.live, 0);
         assertEq(settled.settled, AMOUNT);
         assertEq(pay.purchaseOrderRemaining(payer, poRef), AMOUNT);
+    }
+
+    // ------------------------------------------------------------------
+    // Milestone identity
+    // ------------------------------------------------------------------
+
+    function testCreateRejectsZeroMilestone() public {
+        bytes32 poRef = keccak256("PO 1042");
+        _approvePo(poRef, AMOUNT);
+
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.ZeroMilestone.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "no milestone", poRef, bytes32(0));
+    }
+
+    function testResubmittedMilestoneRevertsWhileBudgetRemains() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        _approvePo(poRef, AMOUNT * 3);
+
+        vm.prank(merchant);
+        uint256 first = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+
+        // The same milestone cannot be billed twice while the first
+        // invoice is still open, even though budget remains.
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.DuplicateMilestone.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1 again", poRef, milestone1);
+
+        // And not after it is paid either: half the budget is still
+        // free, but the milestone identity is spent.
+        _pay(first);
+        assertEq(pay.purchaseOrderRemaining(payer, poRef), AMOUNT * 2);
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.DuplicateMilestone.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1 resubmitted", poRef, milestone1);
+
+        assertEq(pay.invoiceCount(), 1);
+    }
+
+    function testTwoMilestonesSameAmountBothSettle() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        bytes32 milestone2 = keccak256("PO 1042 milestone 2");
+        _approvePo(poRef, AMOUNT * 2);
+
+        // Two legitimate installments with the identical amount: the
+        // milestone references are what tell them apart.
+        vm.prank(merchant);
+        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+        vm.prank(merchant);
+        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 2", poRef, milestone2);
+
+        _pay(a);
+        _pay(b);
+
+        assertTrue(pay.getInvoice(a).status == InvoicePay.Status.Paid);
+        assertTrue(pay.getInvoice(b).status == InvoicePay.Status.Paid);
+        assertEq(pay.getPurchaseOrder(payer, poRef).settled, AMOUNT * 2);
+        assertEq(token.balanceOf(merchant), AMOUNT * 2);
+    }
+
+    function testCancelFreesMilestone() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        _approvePo(poRef, AMOUNT * 2);
+
+        vm.prank(merchant);
+        uint256 first = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1, wrong memo", poRef, milestone1);
+
+        // Cancelling frees the milestone so a corrected invoice can be
+        // issued for the same milestone.
+        vm.prank(merchant);
+        pay.cancelInvoice(first);
+
+        vm.prank(merchant);
+        uint256 corrected = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1, corrected", poRef, milestone1);
+        _pay(corrected);
+        assertTrue(pay.getInvoice(corrected).status == InvoicePay.Status.Paid);
+        assertEq(token.balanceOf(merchant), AMOUNT);
+    }
+
+    function testPaidMilestoneStaysLocked() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        _approvePo(poRef, AMOUNT * 3);
+
+        vm.prank(merchant);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+        _pay(id);
+
+        // Two thirds of the budget remains, but the paid milestone can
+        // never be billed again.
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.DuplicateMilestone.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1 once more", poRef, milestone1);
+    }
+
+    function testSameMilestoneDifferentPurchaseOrders() public {
+        bytes32 poA = keccak256("PO 1042");
+        bytes32 poB = keccak256("PO 1043");
+        bytes32 milestone1 = keccak256("milestone 1");
+        _approvePo(poA, AMOUNT);
+        _approvePo(poB, AMOUNT);
+
+        // The milestone identity is scoped to its purchase order, so
+        // the same milestone reference under another purchase order is
+        // an independent claim.
+        vm.prank(merchant);
+        uint256 a = pay.createInvoice(payer, AMOUNT, dueDate, "PO A milestone 1", poA, milestone1);
+        vm.prank(merchant);
+        uint256 b = pay.createInvoice(payer, AMOUNT, dueDate, "PO B milestone 1", poB, milestone1);
+
+        _pay(a);
+        _pay(b);
+        assertEq(token.balanceOf(merchant), AMOUNT * 2);
+    }
+
+    function _milestoneUsed(bytes32 poRef, bytes32 milestoneRef) internal view returns (bool) {
+        (bool used,,) = pay.milestoneStatus(payer, poRef, milestoneRef);
+        return used;
+    }
+
+    function testMilestoneStatusView() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        _approvePo(poRef, AMOUNT * 2);
+
+        // Free before anything is billed.
+        assertFalse(_milestoneUsed(poRef, milestone1));
+
+        vm.prank(merchant);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+
+        {
+            (bool usedOpen, uint256 openId, InvoicePay.Status openStatus) =
+                pay.milestoneStatus(payer, poRef, milestone1);
+            assertTrue(usedOpen);
+            assertEq(openId, id);
+            assertTrue(openStatus == InvoicePay.Status.Open);
+        }
+
+        // Still claimed after payment, now reporting Paid.
+        _pay(id);
+        {
+            (bool usedPaid, uint256 paidId, InvoicePay.Status paidStatus) =
+                pay.milestoneStatus(payer, poRef, milestone1);
+            assertTrue(usedPaid);
+            assertEq(paidId, id);
+            assertTrue(paidStatus == InvoicePay.Status.Paid);
+        }
+
+        // A cancelled milestone reports free again.
+        bytes32 milestone2 = keccak256("PO 1042 milestone 2");
+        vm.prank(merchant);
+        uint256 second = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 2", poRef, milestone2);
+        vm.prank(merchant);
+        pay.cancelInvoice(second);
+        assertFalse(_milestoneUsed(poRef, milestone2));
+
+        // Another payer sees nothing for the same references.
+        (bool usedStranger,,) = pay.milestoneStatus(stranger, poRef, milestone1);
+        assertFalse(usedStranger);
+    }
+
+    function testExpiryEdgeBothSides() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        bytes32 milestone2 = keccak256("PO 1042 milestone 2");
+        uint256 shortExpiry = block.timestamp + 1 days;
+        vm.prank(payer);
+        pay.approvePurchaseOrder(merchant, poRef, AMOUNT * 2, shortExpiry);
+
+        // Side one: an invoice created while the approval is open can
+        // still be paid after the expiry passes.
+        vm.prank(merchant);
+        uint256 first = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+        vm.warp(shortExpiry + 1);
+        _pay(first);
+        assertTrue(pay.getInvoice(first).status == InvoicePay.Status.Paid);
+
+        // Side two: no new invoice can be created after expiry, even
+        // with budget left and a fresh milestone.
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.PurchaseOrderExpired.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "milestone 2, too late", poRef, milestone2);
+    }
+
+    function testCancelAfterExpiryFreesMilestoneButCreationStaysGated() public {
+        bytes32 poRef = keccak256("PO 1042");
+        bytes32 milestone1 = keccak256("PO 1042 milestone 1");
+        uint256 shortExpiry = block.timestamp + 1 days;
+        vm.prank(payer);
+        pay.approvePurchaseOrder(merchant, poRef, AMOUNT * 2, shortExpiry);
+
+        vm.prank(merchant);
+        uint256 id = pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1", poRef, milestone1);
+
+        // Cancelling after expiry still works and frees the milestone
+        // and the reservation...
+        vm.warp(shortExpiry + 1);
+        vm.prank(merchant);
+        pay.cancelInvoice(id);
+        (bool used,,) = pay.milestoneStatus(payer, poRef, milestone1);
+        assertFalse(used);
+        assertEq(pay.purchaseOrderRemaining(payer, poRef), AMOUNT * 2);
+
+        // ...but the freed milestone cannot be rebilled, because the
+        // approval itself has expired.
+        vm.prank(merchant);
+        vm.expectRevert(InvoicePay.PurchaseOrderExpired.selector);
+        pay.createInvoice(payer, AMOUNT, dueDate, "milestone 1, corrected", poRef, milestone1);
     }
 }
