@@ -114,8 +114,9 @@
     </div>
     <div class="row">
       <div><label>Due in (days)</label><input id="days" type="number" min="1" value="7" /></div>
-      <div><label>Memo</label><input id="memo" value="Invoice for PO 3001, first half" /></div>
+      <div><label>Memo (public on chain)</label><input id="memo" value="Test invoice, first half" /></div>
     </div>
+    <p class="small">The memo is public: it is stored on chain and emitted in the invoice event, so keep it fictional or generic. The purchase order reference and the milestone reference are different: only their hashes go on chain, never the plain text.</p>
     <p class="small" id="milestoneHashNote"></p>
     <button id="create" disabled>Create invoice</button>
     <button id="cancel" disabled class="ghost">Cancel invoice by id (merchant only)</button>
@@ -127,7 +128,7 @@
 
   <section>
     <h2>Guided check: two equal installments settle, a resubmitted milestone is rejected</h2>
-    <p class="hint">This walks through the milestone promise of InvoicePay in five steps. It uses its own purchase order reference below. Use a fresh purchase order text (for example PO 4001) so it does not collide with an approval you already made. Steps A and E run as the payer, steps B, C and D as the merchant, so switch accounts in your wallet between steps. The two installments carry the identical amount on purpose: what tells them apart is the milestone each one names.</p>
+    <p class="hint">This walks through the milestone promise of InvoicePay in five steps. It uses its own purchase order reference below. Use a fresh purchase order text (for example PO 4001) so it does not collide with an approval you already made. Steps A and E run as the payer, steps B, C and D as the merchant, so switch accounts in your wallet between steps. The two installments carry the identical amount on purpose: what tells them apart is the milestone each one names. The memos in this check are neutral labels on purpose: a memo is public on chain, while the purchase order and milestone references are stored only as hashes.</p>
     <div class="row">
       <div><label>Merchant address</label><input id="guideMerchant" placeholder="0x..." /></div>
       <div><label>Payer address</label><input id="guidePayer" placeholder="0x..." /></div>
@@ -285,6 +286,20 @@ $("milestoneRef").addEventListener("input", updateMilestoneNote);
 updateMilestoneNote();
 
 // Turn wallet and contract errors into plain language.
+// Self check note: the guided resubmission step must only treat an exact
+// DuplicateMilestone revert as success. Every other revert keeps its own
+// message below and must never show the green rejected as intended state.
+function revertName(e) {
+  if (!e) return "";
+  if (e.revert && e.revert.name) return e.revert.name;
+  if (e.reason) return e.reason;
+  const raw = String((e.shortMessage || e.message) || "");
+  const known = ["DuplicateMilestone", "WrongMerchant", "AmountExceedsApproval", "PurchaseOrderNotApproved", "PurchaseOrderExpired", "DuplicatePurchaseOrder", "PurchaseOrderAlreadyApproved", "ZeroPurchaseOrder", "ZeroMilestone", "NotPayer", "NotMerchant", "InvoiceNotOpen", "InvoiceNotFound", "ZeroAmount", "ZeroAddress", "DueDateInPast", "ExpiryInPast", "TransferFailed", "ReentrantCall"];
+  for (const name of known) {
+    if (raw.includes(name)) return name;
+  }
+  return "";
+}
 function friendlyError(e) {
   const raw = ((e && e.revert && e.revert.name) || "") + " " + ((e && (e.shortMessage || e.message)) || String(e));
   const lower = raw.toLowerCase();
@@ -652,7 +667,7 @@ $("guideCreate").onclick = async () => {
     const poText = $("guidePo").value.trim();
     const po = await pay.getPurchaseOrder(payer, poHash(poText));
     if (!po.exists) throw new Error("The payer has not approved purchase order \"" + poText + "\" yet. Run step A as the payer first.");
-    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 1", "Guided check installment 1 for " + poText, 7, "guideCreateStatus");
+    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 1", "Guided check installment 1", 7, "guideCreateStatus");
     if (id !== null) guideInvoiceIds[0] = id;
     await refreshList();
   } catch (e) {
@@ -670,7 +685,7 @@ $("guideCreate2").onclick = async () => {
     const poText = $("guidePo").value.trim();
     const po = await pay.getPurchaseOrder(payer, poHash(poText));
     if (!po.exists) throw new Error("The payer has not approved purchase order \"" + poText + "\" yet. Run step A as the payer first.");
-    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 2", "Guided check installment 2 for " + poText, 7, "guideCreate2Status");
+    const id = await createInvoiceFlow(payer, $("guideInstallment").value, poText, poText + " milestone 2", "Guided check installment 2", 7, "guideCreate2Status");
     if (id !== null) guideInvoiceIds[1] = id;
     await refreshList();
   } catch (e) {
@@ -691,14 +706,14 @@ $("guideDuplicate").onclick = async () => {
     setStatus("guideDuplicateStatus", "Milestone 1 is already claimed by invoice " + ms.invoiceId + " and " + fmtAmt(remaining) + " tUSD8 of budget remains. Now resubmitting milestone 1. Confirm in your wallet; the contract should reject it.", "wait");
     const amount = ethers.parseUnits($("guideInstallment").value, 6);
     const due = Math.floor(Date.now() / 1000) + 7 * 86400;
-    const tx = await pay.createInvoice(payer, amount, due, "Resubmitted milestone 1 for " + poText, poHash(poText), poHash(msText));
+    const tx = await pay.createInvoice(payer, amount, due, "Resubmitted milestone 1", poHash(poText), poHash(msText));
     await tx.wait();
     setStatus("guideDuplicateStatus", "Unexpected: the resubmitted milestone was accepted. Tx: " + txLink(tx.hash), "bad");
     log("Resubmitted milestone was accepted (unexpected): " + tx.hash);
     await refreshList();
   } catch (e) {
     const msg = friendlyError(e);
-    if (msg.startsWith("Rejected:")) {
+    if (revertName(e) === "DuplicateMilestone") {
       setStatus("guideDuplicateStatus", "Rejected as intended. " + msg, "ok");
       log("Resubmitted milestone rejected as intended.");
     } else {
@@ -726,7 +741,19 @@ $("guidePay").onclick = async () => {
       lastProof = await payFlow(id, "guidePayStatus");
     }
     if (lastProof) $("guideProof").innerHTML = proofHtml(lastProof);
-    setStatus("guidePayStatus", "Both installments paid. Each milestone settled exactly once and stays locked. Proof for the last payment is below.", "ok");
+    // Self check: only claim both installments paid after reading both
+    // invoice statuses back from the contract. One paid invoice is never
+    // reported as two.
+    const statuses = [];
+    for (const id of ids) {
+      const invAfter = await pay.getInvoice(id);
+      statuses.push(STATUS[Number(invAfter.status)]);
+    }
+    if (ids.length === 2 && statuses.every((s) => s === "Paid")) {
+      setStatus("guidePayStatus", "Both installments paid. Each milestone settled exactly once and stays locked. Proof for the last payment is below.", "ok");
+    } else {
+      setStatus("guidePayStatus", "Payment step finished for invoice " + ids.join(", ") + ". On chain status now reads: " + statuses.join(", ") + ". Both installments count as paid only when both read Paid, so run step C and this step again if one is still open.", "wait");
+    }
     await refreshBalances();
     await refreshList();
   } catch (e) {

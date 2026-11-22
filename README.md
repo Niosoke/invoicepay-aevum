@@ -1,5 +1,8 @@
 # InvoicePay: stablecoin invoices on QDay Aevum
 
+Suggested submission title: InvoicePay, Buyer Approved PO and
+Milestone Payments
+
 An entry for the Aevum Builder Challenge #1 (QDay): one complete
 stablecoin payment flow running on the QDay Aevum testnet.
 
@@ -117,17 +120,53 @@ shows the obligation is settled.
    A paid invoice can never be cancelled or paid twice, and its
    milestone stays claimed forever.
 
-Late payment is accepted. The isOverdue view reports whether an
-open invoice is past its due date. The getPurchaseOrder and
-purchaseOrderRemaining views report the approval terms, how much
-is settled, how much open invoices reserve, and how much is still
-available. The milestoneStatus view reports whether a milestone
-is claimed under an approval, by which invoice, and in what
-status. Approval expiry gates new invoices only: an invoice
-created while the approval was open can still be paid after the
-expiry passes, and cancelling after expiry still frees the
-milestone, but no new invoice can be created once the approval
-has expired.
+Late payment is accepted, and the due date is a marker only.
+The isOverdue view reports whether an open invoice is past its
+due date, but payInvoice never checks the due date: while an
+invoice stays Open the named payer can still pay it, even after
+the due date has passed. Nothing in the contract closes an
+invoice automatically at its due date. The only way an open
+invoice stops being payable is a cancel by its merchant, so the
+effective payment deadline for a stale invoice depends on the
+merchant cancelling it, not on the due date alone. The
+getPurchaseOrder and purchaseOrderRemaining views report the
+approval terms, how much is settled, how much open invoices
+reserve, and how much is still available. The milestoneStatus
+view reports whether a milestone is claimed under an approval,
+by which invoice, and in what status. Approval expiry gates new
+invoices only: an invoice created while the approval was open
+can still be paid after the expiry passes, and cancelling after
+expiry still frees the milestone, but no new invoice can be
+created once the approval has expired.
+
+The memo is public. It is stored on chain with the invoice and
+emitted in the InvoiceCreated event, so anyone can read it. The
+purchase order reference and the milestone reference are not
+public in that way: only their hashes are stored, never the
+plain text. Keep memos fictional or generic, and keep real
+purchase order numbers and milestone names in the hashed
+references only. The web demo follows this rule: its memo
+fields default to neutral labels and never copy the purchase
+order text into a memo.
+
+Revising a purchase order after billing has started needs a new
+reference. An approval locks as soon as any value is settled or
+reserved against it, so after the first installment is paid the
+payer can no longer rewrite the merchant, the cap, or the
+expiry under the same reference. To revise, the payer approves
+a replacement reference for the remaining work, for example a
+new purchase order number that points back to the original one
+in the finance records. The remaining balance to approve under
+the replacement is the original cap minus what is already
+settled, and any invoice still open under the old reference
+stays payable under the old approval until it is paid or the
+merchant cancels it, so settle or cancel those first to avoid
+double counting. Settlement history then spans two approvals:
+each approval keeps its own settled total and its own milestone
+claims, and the finance team links the two references in their
+own records while the explorer and the contract views prove
+each part on chain. Milestone names should stay distinct across
+the replacement so no milestone is billed under both references.
 
 ## Architecture
 
@@ -345,12 +384,23 @@ its approved total, but a single invoice is never paid in parts.
 
 Approval expiry gates new invoices only. An invoice created
 while the approval was open can still be paid after the expiry
-passes, because the invoice carries its own due date. Cancelling
-after expiry still releases the reservation and frees the
-milestone, but the freed milestone cannot be billed again once
-the approval has expired. Finance teams that need a hard payment
-cutoff should set the invoice due dates accordingly and cancel
-stale invoices.
+passes, because the invoice carries its own due date. The due
+date itself only marks an invoice as overdue through the
+isOverdue view: payment stays possible for as long as the
+invoice is Open, and only a cancel by the merchant ends that.
+Cancelling after expiry still releases the reservation and
+frees the milestone, but the freed milestone cannot be billed
+again once the approval has expired. Finance teams that need a
+hard payment cutoff should set the invoice due dates
+accordingly and cancel stale invoices, because the effective
+deadline depends on that cancel, not on the due date alone.
+
+An approval cannot be revised once billing has started. After
+the first invoice reserves or settles value, the merchant, cap,
+and expiry under that reference are locked. A revision uses a
+replacement reference approved for the remaining balance, with
+the two references linked in the finance records as described
+under How it works.
 
 Milestone references are agreed off chain. The contract enforces
 that a milestone is billed at most once per purchase order, but
