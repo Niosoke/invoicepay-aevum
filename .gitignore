@@ -1,0 +1,12 @@
+# Build artifacts
+out/
+cache/
+broadcast/
+
+# Local testnet wallets — NEVER commit keys or passwords
+keystore/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/

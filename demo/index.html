@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>InvoicePay — stablecoin invoices on QDay Aevum</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f7f4ee; color: #1d1a16; }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  .sub { color: #6b6257; margin: 0 0 24px; }
+  section { background: #fff; border: 1px solid #e5ded2; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  label { display: block; font-size: 13px; color: #6b6257; margin: 10px 0 4px; }
+  input { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid #d8d0c2; border-radius: 8px; font-size: 14px; }
+  button { margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 8px; background: #e8641c; color: #fff; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #c9c0b2; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 200px; }
+  pre { background: #171410; color: #f3ead9; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 12.5px; min-height: 60px; white-space: pre-wrap; }
+  code { background: #f1ebdf; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  .ok { color: #1c7c3c; } .bad { color: #b3261e; }
+</style>
+</head>
+<body>
+<main>
+  <h1>InvoicePay</h1>
+  <p class="sub">Stablecoin invoices on QDay Aevum testnet (chain 44005). A merchant creates an invoice in tUSD8, the payer settles it on chain, the contract marks it paid. No custody, no middleman.</p>
+
+  <section>
+    <h2>1. Connect</h2>
+    <div class="row">
+      <div>
+        <label>InvoicePay contract</label>
+        <input id="contract" placeholder="0x… deployed address" />
+      </div>
+      <div>
+        <label>tUSD8 token</label>
+        <input id="token" value="0x456569838f1d43009A91ebA4263147Afd7233483" />
+      </div>
+    </div>
+    <button id="connect">Connect wallet + add Aevum testnet</button>
+    <p id="who"></p>
+  </section>
+
+  <section>
+    <h2>2. Merchant: create invoice</h2>
+    <div class="row">
+      <div><label>Payer address</label><input id="payer" placeholder="0x…" /></div>
+      <div><label>Amount (tUSD8)</label><input id="amount" type="number" step="0.000001" value="1" /></div>
+    </div>
+    <div class="row">
+      <div><label>Due in (days)</label><input id="days" type="number" value="7" /></div>
+      <div><label>Memo</label><input id="memo" value="Invoice 1, demo payment" /></div>
+    </div>
+    <button id="create" disabled>Create invoice</button>
+  </section>
+
+  <section>
+    <h2>3. Payer: pay invoice</h2>
+    <div class="row">
+      <div><label>Invoice id</label><input id="invoiceId" type="number" value="0" /></div>
+    </div>
+    <button id="pay" disabled>Approve + pay</button>
+    <button id="read" disabled style="background:#3d362c">Read invoice</button>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log">Waiting…</pre>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script>
+const AEVUM = {
+  chainId: "0xABE5",
+  chainName: "QDay Aevum Testnet",
+  nativeCurrency: { name: "tQDAY", symbol: "tQDAY", decimals: 18 },
+  rpcUrls: ["https://rpc-test.qday.info"],
+  blockExplorerUrls: ["https://explorer-test.qday.info"],
+};
+const PAY_ABI = [
+  "function createInvoice(address payer, uint256 amount, uint256 dueDate, string memo) returns (uint256)",
+  "function payInvoice(uint256 invoiceId)",
+  "function getInvoice(uint256 invoiceId) view returns (tuple(address merchant, address payer, uint256 amount, uint256 dueDate, uint256 paidAt, string memo, uint8 status))",
+  "function invoiceCount() view returns (uint256)",
+  "event InvoiceCreated(uint256 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount, uint256 dueDate, string memo)",
+  "event InvoicePaid(uint256 indexed invoiceId, address indexed payer, address indexed merchant, uint256 amount, uint256 paidAt)",
+];
+const ERC20_ABI = [
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function balanceOf(address account) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+];
+const STATUS = ["Open", "Paid", "Cancelled"];
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  if (logEl.textContent === "Waiting…") logEl.textContent = "";
+  logEl.appendChild(line);
+}
+let signer, pay, token;
+
+$("connect").onclick = async () => {
+  try {
+    if (!window.ethereum) throw new Error("No wallet found. Install MetaMask first.");
+    await window.ethereum.request({ method: "wallet_addEthereumChain", params: [AEVUM] });
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    signer = await provider.getSigner();
+    const addr = await signer.getAddress();
+    const contractAddr = $("contract").value.trim();
+    if (!ethers.isAddress(contractAddr)) throw new Error("Paste the deployed InvoicePay address first.");
+    pay = new ethers.Contract(contractAddr, PAY_ABI, signer);
+    token = new ethers.Contract($("token").value.trim(), ERC20_ABI, signer);
+    const bal = await token.balanceOf(addr);
+    $("who").innerHTML = "Connected: <code>" + addr + "</code> · tUSD8 balance: " + ethers.formatUnits(bal, 6);
+    ["create", "pay", "read"].forEach((id) => ($(id).disabled = false));
+    log("Connected on Aevum testnet.", "ok");
+  } catch (e) { log("Connect failed: " + e.message, "bad"); }
+};
+
+$("create").onclick = async () => {
+  try {
+    const payer = $("payer").value.trim();
+    const amount = ethers.parseUnits($("amount").value, 6);
+    const due = Math.floor(Date.now() / 1000) + Number($("days").value) * 86400;
+    const tx = await pay.createInvoice(payer, amount, due, $("memo").value);
+    log("createInvoice sent: " + tx.hash);
+    const receipt = await tx.wait();
+    const ev = receipt.logs.map((l) => { try { return pay.interface.parseLog(l); } catch { return null; } })
+      .find((p) => p && p.name === "InvoiceCreated");
+    if (ev) { $("invoiceId").value = ev.args.invoiceId.toString(); log("Invoice created, id " + ev.args.invoiceId, "ok"); }
+  } catch (e) { log("Create failed: " + e.message, "bad"); }
+};
+
+$("pay").onclick = async () => {
+  try {
+    const id = $("invoiceId").value;
+    const inv = await pay.getInvoice(id);
+    log("Approving " + ethers.formatUnits(inv.amount, 6) + " tUSD8…");
+    const ap = await token.approve(await pay.getAddress(), inv.amount);
+    await ap.wait();
+    log("Approved: " + ap.hash);
+    const tx = await pay.payInvoice(id);
+    log("payInvoice sent: " + tx.hash);
+    await tx.wait();
+    log("Invoice " + id + " paid.", "ok");
+  } catch (e) { log("Pay failed: " + e.message, "bad"); }
+};
+
+$("read").onclick = async () => {
+  try {
+    const inv = await pay.getInvoice($("invoiceId").value);
+    log(JSON.stringify({
+      merchant: inv.merchant, payer: inv.payer,
+      amount: ethers.formatUnits(inv.amount, 6) + " tUSD8",
+      dueDate: new Date(Number(inv.dueDate) * 1000).toISOString(),
+      paidAt: inv.paidAt === 0n ? null : new Date(Number(inv.paidAt) * 1000).toISOString(),
+      memo: inv.memo, status: STATUS[Number(inv.status)],
+    }, null, 2));
+  } catch (e) { log("Read failed: " + e.message, "bad"); }
+};
+</script>
+</body>
+</html>
